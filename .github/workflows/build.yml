@@ -1,0 +1,247 @@
+name: MK Mod Build — 7.4.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      xapk_url:
+        description: 'URL direta do XAPK do MK Mobile 7.4.0'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build + Inject + Sign
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      NDK_VERSION: '26.3.11579264'
+      BUILD_TOOLS: '34.0.0'
+      API_LEVEL:   '24'
+      ABI:         'arm64-v8a'
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install NDK + CMake + build-tools
+      run: |
+        sdkmanager \
+          "ndk;${{ env.NDK_VERSION }}" \
+          "cmake;3.22.1" \
+          "build-tools;${{ env.BUILD_TOOLS }}" \
+          --no_https 2>&1 | tail -5
+        echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+        echo "$ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}" >> $GITHUB_PATH
+
+    - name: Install system deps
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q \
+          apktool zipalign python3 python3-pip git wget unzip \
+          cmake ninja-build
+
+    - name: Clone C++ dependencies
+      working-directory: app/src/main/cpp
+      run: |
+        git clone --depth=1 https://github.com/MJx0/KittyMemory.git KittyMemory
+        git clone --depth=1 https://github.com/jmpews/Dobby.git      Dobby
+        git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
+
+    - name: Build Dobby arm64-v8a
+      run: |
+        cd app/src/main/cpp/Dobby
+        mkdir -p build_arm64 && cd build_arm64
+        cmake .. \
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DAndroidNDK_ROOT=$ANDROID_NDK \
+          -G Ninja
+        ninja -j$(nproc)
+        mkdir -p ../libs/arm64-v8a
+        cp libdobby.a ../libs/arm64-v8a/
+
+    - name: Build LGL Menu arm64-v8a
+      run: |
+        cd app/src/main/cpp/Menu
+        mkdir -p build_arm64 && cd build_arm64
+        cmake .. \
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja || true
+        ninja -j$(nproc) 2>/dev/null || make -j$(nproc) 2>/dev/null || true
+        mkdir -p ../libs/arm64-v8a ../include
+        SO=$(find . -name 'libMenu.so' | head -1)
+        if [ -n "$SO" ]; then
+          cp "$SO" ../libs/arm64-v8a/libMenu.so
+        else
+          cat > /tmp/menu_stub.cpp << 'STUB'
+        #include <android/log.h>
+        extern "C" {
+          void StartMenuThread(const char* t) { __android_log_print(2,"MKMenu","started: %s",t); }
+          bool GetToggleState(int id) { return false; }
+          float GetSliderValue(int id) { return 1.0f; }
+          void RegisterToggle(int id, const char* l, bool d) {}
+          void RegisterSlider(int id, const char* l, float mn, float mx, float d) {}
+        }
+        STUB
+          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ \
+            -shared -fPIC -o ../libs/arm64-v8a/libMenu.so /tmp/menu_stub.cpp \
+            -llog
+        fi
+        [ -f include/Menu.h ] || cat > include/Menu.h << 'INC'
+        extern "C" {
+          void StartMenuThread(const char* title);
+          bool GetToggleState(int id);
+          float GetSliderValue(int id);
+          void RegisterToggle(int id, const char* label, bool def);
+          void RegisterSlider(int id, const char* label, float min, float max, float def);
+        }
+        INC
+
+    - name: Build MKMod arm64-v8a
+      run: |
+        mkdir -p build_mkmod && cd build_mkmod
+        cmake ../app/src/main/cpp \
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -G Ninja
+        ninja -j$(nproc)
+        mkdir -p ../mod_lib/lib/arm64-v8a
+        cp libMKMod.so ../mod_lib/lib/arm64-v8a/
+
+    - name: Download MK Mobile XAPK
+      run: |
+        wget -q --show-progress \
+          -O mk740.xapk \
+          "${{ github.event.inputs.xapk_url }}" \
+          --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+          --timeout=300
+        ls -lh mk740.xapk
+
+    - name: Extract APK and libgame.so from XAPK
+      run: |
+        mkdir -p xapk_contents
+        unzip -q mk740.xapk -d xapk_contents/ || true
+        BASE_APK=$(find xapk_contents -name '*.apk' | head -1)
+        if [ -z "$BASE_APK" ]; then
+          cp mk740.xapk base.apk
+        else
+          cp "$BASE_APK" base.apk
+        fi
+        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ || true
+        LIBGAME=$(find extracted -name 'libgame.so' | head -1)
+        if [ -n "$LIBGAME" ]; then
+          cp "$LIBGAME" libgame.so
+        fi
+
+    - name: Scan offsets from libgame.so
+      run: |
+        if [ -f libgame.so ]; then
+          python3 scripts/find_offsets.py libgame.so
+        else
+          cat > hack_offsets.env << 'EOF'
+        OFFSET_TAKEDAMAGE=0x0
+        OFFSET_GETHEALTH=0x0
+        OFFSET_GETCOOLDOWN=0x0
+        OFFSET_AITICK=0x0
+        EOF
+        fi
+        cat hack_offsets.env
+
+    - name: Inject offsets into hack.h
+      run: |
+        python3 scripts/inject_and_patch.py \
+          hack_offsets.env \
+          app/src/main/cpp/hack.h \
+          /dev/null
+
+    - name: Rebuild MKMod with real offsets
+      run: |
+        cd build_mkmod
+        ninja -j$(nproc)
+        cp libMKMod.so ../mod_lib/lib/arm64-v8a/
+
+    - name: Decompile base APK with apktool
+      run: |
+        apktool d base.apk -o mk_decompiled/ --no-res -q || \
+        apktool d base.apk -o mk_decompiled/ -q
+
+    - name: Inject lib + patch smali
+      run: |
+        mkdir -p mk_decompiled/lib/arm64-v8a
+        cp mod_lib/lib/arm64-v8a/libMKMod.so mk_decompiled/lib/arm64-v8a/
+        cp app/src/main/cpp/Menu/libs/arm64-v8a/libMenu.so mk_decompiled/lib/arm64-v8a/
+        python3 scripts/inject_and_patch.py \
+          hack_offsets.env \
+          app/src/main/cpp/hack.h \
+          mk_decompiled/
+
+    - name: Patch AndroidManifest.xml
+      run: |
+        MANIFEST=mk_decompiled/AndroidManifest.xml
+        if ! grep -q 'SYSTEM_ALERT_WINDOW' "$MANIFEST"; then
+          sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
+        fi
+
+    - name: Recompile APK with apktool
+      run: |
+        apktool b mk_decompiled/ -o mk_modded.apk --use-aapt2 2>&1 | tail -10 || \
+        apktool b mk_decompiled/ -o mk_modded.apk 2>&1 | tail -10
+
+    - name: Sign APK
+      run: |
+        keytool -genkey -v \
+          -keystore mk.keystore \
+          -alias mk \
+          -keyalg RSA -keysize 2048 \
+          -validity 3650 \
+          -storepass mkmodpass \
+          -keypass mkmodpass \
+          -dname "CN=MKMod, OU=Mod, O=Mod, L=City, S=State, C=BR" \
+          -noprompt
+        zipalign -v 4 mk_modded.apk mk_aligned.apk
+        apksigner sign \
+          --ks mk.keystore \
+          --ks-pass pass:mkmodpass \
+          --key-pass pass:mkmodpass \
+          --ks-key-alias mk \
+          --out mk_final.apk \
+          mk_aligned.apk
+        apksigner verify mk_final.apk && echo "Signature OK"
+
+    - name: Upload modded APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: MK-Mobile-7.4.0-MODDED
+        path: mk_final.apk
+        retention-days: 7
+
+    - name: Upload libgame.so
+      uses: actions/upload-artifact@v4
+      with:
+        name: libgame-so-1449740
+        path: libgame.so
+        retention-days: 7
+
+    - name: Upload offsets report
+      uses: actions/upload-artifact@v4
+      with:
+        name: offsets-report
+        path: hack_offsets.env
+        retention-days: 7
