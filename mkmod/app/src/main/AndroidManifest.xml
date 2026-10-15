@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Manifest do projeto de BUILD — não é esse que vai pro APK final.
+     O APK final usa o manifest original do MK Mobile, patchado pelo CI. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <application
+        android:label="MKMod"
+        android:hasCode="false">
+    </application>
+</manifest>
