@@ -1,4 +1,4 @@
-name: MK Mod Build — XAPK UE4 Inject Fix v8
+name: MK Mod Build — XAPK KittyMemory Fix v9
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - Inject Fix V8
+    - name: Confirmar versao do workflow - KittyMemory V9
       run: |
-        echo "::notice::INJECT FIX V8 ATIVO"
+        echo "::notice::KITTYMEMORY FIX V9 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -303,6 +303,23 @@ jobs:
       run: |
         set -euo pipefail
         git clone --depth=1 https://github.com/MJx0/KittyMemory.git KittyMemory
+        # O repositorio oficial guarda os .cpp em KittyMemory/KittyMemory/.
+        # O CMake do projeto usa KittyMemory/KittyMemory.cpp (sem nivel extra).
+        # Corrige a organizacao SEM criar arquivos C++ falsos ou alterar o CMake.
+        if [ -f KittyMemory/KittyMemory/KittyMemory.cpp ]; then
+          cp -a KittyMemory/KittyMemory/. KittyMemory/
+          echo '::notice::KittyMemory reorganizado para os caminhos esperados pelo CMake.'
+        fi
+        # Falhar AQUI, antes de compilar Dobby e Menu, se faltarem fontes.
+        for source in KittyMemory.cpp KittyUtils.cpp MemoryPatch.cpp; do
+          if [ ! -s "KittyMemory/$source" ]; then
+            echo "::error::KittyMemory/$source ausente apos normalizacao."
+            echo 'Estrutura retornada pelo clone:'
+            find KittyMemory -maxdepth 3 -type f -name '*.cpp' -print | head -50
+            exit 1
+          fi
+        done
+        ls -lh KittyMemory/KittyMemory.cpp KittyMemory/KittyUtils.cpp KittyMemory/MemoryPatch.cpp
         # O master atual do Dobby possui erros de API e assembly ARM64.
         # Usar o commit completo citado por outro projeto que compila Android arm64.
         git clone https://github.com/jmpews/Dobby.git Dobby
@@ -486,6 +503,14 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
+        # Diagnostico rapido para evitar o erro "Cannot find source file".
+        for source in KittyMemory.cpp KittyUtils.cpp MemoryPatch.cpp; do
+          test -s "app/src/main/cpp/KittyMemory/$source" || {
+            echo "::error::KittyMemory/$source nao existe no caminho esperado pelo CMake."
+            exit 1
+          }
+        done
+        rm -rf build_mkmod
         cmake -S app/src/main/cpp -B build_mkmod -G Ninja \
           -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
           -DANDROID_ABI="$TARGET_ABI" \
@@ -861,3 +886,4 @@ jobs:
           echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
         fi
         if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
+
