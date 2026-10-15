@@ -1,4 +1,4 @@
-name: MK Mod Build — 7.4.0 — Dobby ELF Fix v3
+name: MK Mod Build — 7.4.0 — Dobby Stable v4
 
 on:
   workflow_dispatch:
@@ -19,6 +19,7 @@ jobs:
       BUILD_TOOLS:  '34.0.0'
       API_LEVEL:    '24'
       ANDROID_SDK:  '/opt/android-sdk'
+      DOBBY_COMMIT: '0932d69c320e786672361ab53825ba8f4245e9d3'
 
     steps:
 
@@ -26,9 +27,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - DOBBY ELF FIX V3
+    - name: Confirmar versao do workflow - DOBBY STABLE V4
       run: |
-        echo "::notice::DOBBY ELF FIX V3 ATIVO"
+        echo "::notice::DOBBY STABLE V4 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -86,72 +87,55 @@ jobs:
       run: |
         set -euo pipefail
         git clone --depth=1 https://github.com/MJx0/KittyMemory.git KittyMemory
-        git clone --depth=1 https://github.com/jmpews/Dobby.git      Dobby
+        # O master atual do Dobby possui erros de API e assembly ARM64.
+        # Usar o commit completo citado por outro projeto que compila Android arm64.
+        git clone https://github.com/jmpews/Dobby.git Dobby
+        git -C Dobby checkout --detach "$DOBBY_COMMIT"
+        DOBBY_CHECKED_OUT="$(git -C Dobby rev-parse HEAD)"
+        test "$DOBBY_CHECKED_OUT" = "$DOBBY_COMMIT"
+        echo "::notice::Dobby pinado em $DOBBY_CHECKED_OUT"
+        test -f Dobby/CMakeLists.txt
+        test -f Dobby/include/dobby.h
+        test -f Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.cc
         git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
 
-    # ── 6. Dobby ARM64: patch ELF + preflight de assembly ───────────────────
-    - name: Patch Dobby ELF ARM64 + compile libdobby.a [V3]
+    # ── 6. Dobby ARM64: fonte historica estavel, sem patch ELF ─────────────
+    - name: Build Dobby ARM64 from pinned working commit [V4]
       shell: bash
       run: |
         set -euo pipefail
         cd app/src/main/cpp/Dobby
-        echo "::group::Aplicar patch de relocacao ELF"
-        python3 - <<'PYARM'
-        from pathlib import Path
-
-        path = Path('source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm')
-        source = path.read_text()
-        old = (
-            'adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE',
-            'add TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF',
-        )
-        new = (
-            'adrp TMP_REG_0, :got:cdecl(common_closure_bridge_handler)',
-            'ldr TMP_REG_0, [TMP_REG_0, :got_lo12:cdecl(common_closure_bridge_handler)]',
-        )
-        if all(source.count(line) == 1 for line in old):
-            for before, after in zip(old, new):
-                source = source.replace(before, after)
-            path.write_text(source)
-            print('OK: relocacoes Mach-O substituidas por ELF GOT.')
-        elif all(source.count(line) == 1 for line in new):
-            print('OK: patch ja estava aplicado.')
-        else:
-            raise SystemExit('ERRO: o codigo upstream do Dobby mudou; nao compilarei um arquivo sem patch.')
-
-        source = path.read_text()
-        if '@PAGE' in source or '@PAGEOFF' in source or not all(line in source for line in new):
-            raise SystemExit('ERRO: verificacao do patch falhou. Ainda ha instrucoes incompatíveis.')
-        for n, line in enumerate(source.splitlines(), 1):
-            if ':got:' in line or ':got_lo12:' in line:
-                print(f'{path}:{n}: {line.strip()}')
-        PYARM
-        echo "::endgroup::"
-
-        echo "::group::Teste real da montagem ARM64 usando Clang do NDK"
-        NDK_CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-        test -x "$NDK_CLANG"
-        "$NDK_CLANG" -target "aarch64-none-linux-android${{ env.API_LEVEL }}" \
-          -fPIC -x assembler-with-cpp \
-          -c source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm \
-          -o /tmp/dobby_closure_bridge_arm64.o
-        readelf -r /tmp/dobby_closure_bridge_arm64.o
-        readelf -r /tmp/dobby_closure_bridge_arm64.o | grep -q 'R_AARCH64_ADR_GOT'
-        echo 'OK: Assembly ARM64 ELF compila e gera relocacao GOT.'
-        echo "::endgroup::"
-
+        echo "Dobby commit: $(git rev-parse HEAD)"
+        test "$(git rev-parse HEAD)" = "$DOBBY_COMMIT" || {
+          echo '::error::Versao errada do Dobby! Build interrompido.'
+          exit 1
+        }
+        # Essa revisao utiliza o bridge ARM64 em C++; nao usa o assembly
+        # @PAGE/@PAGEOFF que quebrou no master em 2026.
+        test -f source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.cc
+        rm -rf build_arm64
         cmake -S . -B build_arm64 -G Ninja \
           -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
           -DANDROID_ABI=arm64-v8a \
           -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
           -DCMAKE_BUILD_TYPE=Release \
+          -DDOBBY_DEBUG=OFF \
           -DDOBBY_BUILD_EXAMPLE=OFF \
           -DDOBBY_BUILD_TEST=OFF
         cmake --build build_arm64 --target dobby_static --parallel 4
-        test -s build_arm64/libdobby.a
+        test -s build_arm64/libdobby.a || {
+          echo '::error::Dobby compilou mas nao gerou libdobby.a.'
+          exit 1
+        }
+        NDK_NM="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+        "$NDK_NM" -g --defined-only build_arm64/libdobby.a > /tmp/dobby-symbols.txt
+        grep -Eq '[[:space:]]DobbyHook$' /tmp/dobby-symbols.txt || {
+          echo '::error::libdobby.a nao contem DobbyHook.'
+          exit 1
+        }
         mkdir -p libs/arm64-v8a
         cp build_arm64/libdobby.a libs/arm64-v8a/libdobby.a
-        echo 'OK: Dobby ARM64 compilado.'
+        echo '::notice::Dobby estavel ARM64 compilado com sucesso!'
         ls -lh libs/arm64-v8a/libdobby.a
 
     # ── 7. LGL Menu (stub quando o upstream nao fornece libMenu.so) ──────────
