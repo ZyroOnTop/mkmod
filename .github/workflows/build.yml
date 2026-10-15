@@ -1,4 +1,4 @@
-name: MK Mod Build — 7.4.0
+name: MK Mod Build — 7.4.0 — Dobby ELF Fix v3
 
 on:
   workflow_dispatch:
@@ -25,6 +25,12 @@ jobs:
     # ── 1. Checkout ──────────────────────────────────────────────────────────
     - name: Checkout repo
       uses: actions/checkout@v4
+
+    - name: Confirmar versao do workflow - DOBBY ELF FIX V3
+      run: |
+        echo "::notice::DOBBY ELF FIX V3 ATIVO"
+        echo "Commit utilizado: $GITHUB_SHA"
+        echo "Ref selecionada: $GITHUB_REF"
 
     # ── 2. Java 17 ───────────────────────────────────────────────────────────
     - name: Setup Java 17
@@ -78,29 +84,77 @@ jobs:
     - name: Clone C++ dependencies
       working-directory: app/src/main/cpp
       run: |
+        set -euo pipefail
         git clone --depth=1 https://github.com/MJx0/KittyMemory.git KittyMemory
         git clone --depth=1 https://github.com/jmpews/Dobby.git      Dobby
         git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
 
-    # ── 6. Build Dobby ────────────────────────────────────────────────────────
-    - name: Build Dobby arm64-v8a
+    # ── 6. Dobby ARM64: patch ELF + preflight de assembly ───────────────────
+    - name: Patch Dobby ELF ARM64 + compile libdobby.a [V3]
+      shell: bash
       run: |
-        set -e
+        set -euo pipefail
         cd app/src/main/cpp/Dobby
-        mkdir -p build_arm64 && cd build_arm64
-        cmake .. \
-          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a \
-          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DAndroidNDK_ROOT=$ANDROID_NDK \
-          -G Ninja
-        ninja -j$(nproc)
-        mkdir -p ../libs/arm64-v8a
-        cp libdobby.a ../libs/arm64-v8a/
-        echo "Dobby OK: $(ls -lh ../libs/arm64-v8a/)"
+        echo "::group::Aplicar patch de relocacao ELF"
+        python3 - <<'PYARM'
+        from pathlib import Path
 
-    # ── 7. Build LGL Menu ─────────────────────────────────────────────────────
+        path = Path('source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm')
+        source = path.read_text()
+        old = (
+            'adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE',
+            'add TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF',
+        )
+        new = (
+            'adrp TMP_REG_0, :got:cdecl(common_closure_bridge_handler)',
+            'ldr TMP_REG_0, [TMP_REG_0, :got_lo12:cdecl(common_closure_bridge_handler)]',
+        )
+        if all(source.count(line) == 1 for line in old):
+            for before, after in zip(old, new):
+                source = source.replace(before, after)
+            path.write_text(source)
+            print('OK: relocacoes Mach-O substituidas por ELF GOT.')
+        elif all(source.count(line) == 1 for line in new):
+            print('OK: patch ja estava aplicado.')
+        else:
+            raise SystemExit('ERRO: o codigo upstream do Dobby mudou; nao compilarei um arquivo sem patch.')
+
+        source = path.read_text()
+        if '@PAGE' in source or '@PAGEOFF' in source or not all(line in source for line in new):
+            raise SystemExit('ERRO: verificacao do patch falhou. Ainda ha instrucoes incompatíveis.')
+        for n, line in enumerate(source.splitlines(), 1):
+            if ':got:' in line or ':got_lo12:' in line:
+                print(f'{path}:{n}: {line.strip()}')
+        PYARM
+        echo "::endgroup::"
+
+        echo "::group::Teste real da montagem ARM64 usando Clang do NDK"
+        NDK_CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+        test -x "$NDK_CLANG"
+        "$NDK_CLANG" -target "aarch64-none-linux-android${{ env.API_LEVEL }}" \
+          -fPIC -x assembler-with-cpp \
+          -c source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm \
+          -o /tmp/dobby_closure_bridge_arm64.o
+        readelf -r /tmp/dobby_closure_bridge_arm64.o
+        readelf -r /tmp/dobby_closure_bridge_arm64.o | grep -q 'R_AARCH64_ADR_GOT'
+        echo 'OK: Assembly ARM64 ELF compila e gera relocacao GOT.'
+        echo "::endgroup::"
+
+        cmake -S . -B build_arm64 -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DDOBBY_BUILD_EXAMPLE=OFF \
+          -DDOBBY_BUILD_TEST=OFF
+        cmake --build build_arm64 --target dobby_static --parallel 4
+        test -s build_arm64/libdobby.a
+        mkdir -p libs/arm64-v8a
+        cp build_arm64/libdobby.a libs/arm64-v8a/libdobby.a
+        echo 'OK: Dobby ARM64 compilado.'
+        ls -lh libs/arm64-v8a/libdobby.a
+
+    # ── 7. LGL Menu (stub quando o upstream nao fornece libMenu.so) ──────────
     - name: Build LGL Menu arm64-v8a
       run: |
         cd app/src/main/cpp/Menu
@@ -119,7 +173,7 @@ jobs:
           cp "$SO" ../libs/arm64-v8a/libMenu.so
           echo "Menu lib: $SO"
         else
-          echo "Creating Menu stub..."
+          echo '::warning::LGL nao gerou libMenu.so. Criando somente stub para vinculacao; este stub NAO exibe menu funcional.'
           cat > /tmp/menu_stub.cpp << 'STUB'
         #include <android/log.h>
         extern "C" {
@@ -146,160 +200,120 @@ jobs:
         INC
         ls -lh ../libs/arm64-v8a/
 
-    # ── 8. Build MKMod.so ─────────────────────────────────────────────────────
-    - name: Build MKMod arm64-v8a
-      run: |
-        set -e
-        mkdir -p build_mkmod && cd build_mkmod
-        cmake ../app/src/main/cpp \
-          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a \
-          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
-          -DCMAKE_BUILD_TYPE=Release \
-          -G Ninja
-        ninja -j$(nproc)
-        mkdir -p ../mod_lib/lib/arm64-v8a
-        cp libMKMod.so ../mod_lib/lib/arm64-v8a/
-        echo "MKMod.so: $(ls -lh ../mod_lib/lib/arm64-v8a/)"
-
     # ── 9. Download XAPK ──────────────────────────────────────────────────────
     - name: Download MK Mobile XAPK
+      shell: bash
+      env:
+        XAPK_URL: ${{ inputs.xapk_url }}
       run: |
-        wget -q --show-progress \
-          -O mk740.xapk \
-          "${{ github.event.inputs.xapk_url }}" \
-          --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-          --timeout=300
+        set -euo pipefail
+        test -n "$XAPK_URL" || { echo 'URL do XAPK vazia'; exit 1; }
+        curl --fail --location --retry 3 --connect-timeout 30 --max-time 1200 \
+          --user-agent 'Mozilla/5.0' --output mk740.xapk "$XAPK_URL"
+        test -s mk740.xapk
+        unzip -tq mk740.xapk | tail -2
         ls -lh mk740.xapk
 
     # ── 10. Extrair APK e libgame.so ──────────────────────────────────────────
     - name: Extract APK and libgame.so
+      shell: bash
       run: |
-        mkdir -p xapk_contents
-        unzip -q mk740.xapk -d xapk_contents/ || true
-        BASE_APK=$(find xapk_contents -name '*.apk' | grep -v split | head -1)
-        [ -z "$BASE_APK" ] && cp mk740.xapk base.apk || cp "$BASE_APK" base.apk
-        echo "Base APK: $(ls -lh base.apk)"
+        set -euo pipefail
+        mkdir -p xapk_contents extracted
+        unzip -q mk740.xapk -d xapk_contents/
+        mapfile -d '' APKS < <(find xapk_contents -type f -iname '*.apk' -print0)
+        if [ "${#APKS[@]}" -eq 0 ]; then
+          echo 'ERRO: XAPK nao contem APKs.'
+          exit 1
+        fi
+        BASE_APK=''
+        for apk in "${APKS[@]}"; do
+          if [ "$(basename "$apk")" = 'base.apk' ]; then BASE_APK="$apk"; break; fi
+        done
+        if [ -z "$BASE_APK" ]; then
+          for apk in "${APKS[@]}"; do
+            case "$(basename "$apk")" in split_*) ;; *) BASE_APK="$apk"; break ;; esac
+          done
+        fi
+        BASE_APK="${BASE_APK:-${APKS[0]}}"
+        cp "$BASE_APK" base.apk
+        echo "Base APK: $BASE_APK"
 
-        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ 2>/dev/null || true
-        LIBGAME=$(find extracted -name 'libgame.so' | head -1)
-        if [ -n "$LIBGAME" ]; then
-          cp "$LIBGAME" libgame.so
-          echo "libgame.so: $(ls -lh libgame.so)"
-        else
-          echo "WARNING: libgame.so not found"
-          unzip -l base.apk | grep '\.so' | head -20
+        FOUND=0
+        for apk in "${APKS[@]}"; do
+          if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libgame.so' >/dev/null; then
+            unzip -p "$apk" lib/arm64-v8a/libgame.so > libgame.so
+            FOUND=1
+            echo "libgame.so extraida de: $apk"
+            break
+          fi
+        done
+        if [ "$FOUND" -ne 1 ]; then
+          echo 'ERRO: nenhum APK do XAPK possui lib/arm64-v8a/libgame.so.'
+          echo 'Bibliotecas encontradas:'
+          for apk in "${APKS[@]}"; do
+            echo "-- $apk"
+            unzip -Z1 "$apk" | grep -E '^lib/.*\.so$' | head -20 || true
+          done
+          exit 1
+        fi
+        test -s libgame.so
+        ls -lh base.apk libgame.so
+        if [ "${#APKS[@]}" -gt 1 ]; then
+          echo 'AVISO: XAPK com APKs split. Assinar somente o base.apk nao recria um APK universal.'
         fi
 
     # ── 11. Scan offsets ──────────────────────────────────────────────────────
     - name: Scan offsets from libgame.so
+      shell: bash
       run: |
-        if [ -f libgame.so ]; then
-          python3 scripts/find_offsets.py libgame.so
-        else
-          cat > hack_offsets.env << 'EOF'
-        OFFSET_TAKEDAMAGE=0x0
-        OFFSET_GETHEALTH=0x0
-        OFFSET_GETCOOLDOWN=0x0
-        OFFSET_AITICK=0x0
-        EOF
-        fi
+        set -euo pipefail
+        test -s libgame.so || { echo 'libgame.so ausente'; exit 1; }
+        test -f scripts/find_offsets.py || { echo 'scripts/find_offsets.py ausente'; exit 1; }
+        python3 scripts/find_offsets.py libgame.so
+        test -s hack_offsets.env || { echo 'Script nao gerou hack_offsets.env'; exit 1; }
         cat hack_offsets.env
 
     # ── 12. Inject offsets no hack.h ─────────────────────────────────────────
     - name: Inject offsets into hack.h
       run: |
+        set -euo pipefail
         python3 scripts/inject_and_patch.py \
           hack_offsets.env \
           app/src/main/cpp/hack.h \
           /dev/null
 
 
-    # ── 8. Build MKMod.so ─────────────────────────────────────────────────────
+    # ── 13. Build MKMod.so (com offsets injetados) ──────────────────────────
     - name: Build MKMod arm64-v8a
+      shell: bash
       run: |
-        set -e
-        mkdir -p build_mkmod && cd build_mkmod
-        cmake ../app/src/main/cpp \
-          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+        set -euo pipefail
+        cmake -S app/src/main/cpp -B build_mkmod -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
           -DANDROID_ABI=arm64-v8a \
-          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
-          -DCMAKE_BUILD_TYPE=Release \
-          -G Ninja
-        ninja -j$(nproc)
-        mkdir -p ../mod_lib/lib/arm64-v8a
-        cp libMKMod.so ../mod_lib/lib/arm64-v8a/
-        echo "MKMod.so: $(ls -lh ../mod_lib/lib/arm64-v8a/)"
+          -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build_mkmod --parallel 4
+        test -s build_mkmod/libMKMod.so
+        mkdir -p mod_lib/lib/arm64-v8a
+        cp build_mkmod/libMKMod.so mod_lib/lib/arm64-v8a/
+        ls -lh mod_lib/lib/arm64-v8a/libMKMod.so
 
-    # ── 9. Download XAPK ──────────────────────────────────────────────────────
-    - name: Download MK Mobile XAPK
-      run: |
-        wget -q --show-progress \
-          -O mk740.xapk \
-          "${{ github.event.inputs.xapk_url }}" \
-          --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-          --timeout=300
-        ls -lh mk740.xapk
-
-    # ── 10. Extrair APK e libgame.so ──────────────────────────────────────────
-    - name: Extract APK and libgame.so
-      run: |
-        mkdir -p xapk_contents
-        unzip -q mk740.xapk -d xapk_contents/ || true
-        BASE_APK=$(find xapk_contents -name '*.apk' | grep -v split | head -1)
-        [ -z "$BASE_APK" ] && cp mk740.xapk base.apk || cp "$BASE_APK" base.apk
-        echo "Base APK: $(ls -lh base.apk)"
-        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ 2>/dev/null || true
-        LIBGAME=$(find extracted -name 'libgame.so' | head -1)
-        if [ -n "$LIBGAME" ]; then
-          cp "$LIBGAME" libgame.so
-          echo "libgame.so: $(ls -lh libgame.so)"
-        else
-          echo "WARNING: libgame.so not found"
-          unzip -l base.apk | grep '\.so' | head -20
-        fi
-
-    # ── 11. Scan offsets ──────────────────────────────────────────────────────
-    - name: Scan offsets from libgame.so
-      run: |
-        if [ -f libgame.so ]; then
-          python3 scripts/find_offsets.py libgame.so
-        else
-          cat > hack_offsets.env << 'EOF'
-        OFFSET_TAKEDAMAGE=0x0
-        OFFSET_GETHEALTH=0x0
-        OFFSET_GETCOOLDOWN=0x0
-        OFFSET_AITICK=0x0
-        EOF
-        fi
-        cat hack_offsets.env
-
-    # ── 12. Inject offsets no hack.h ─────────────────────────────────────────
-    - name: Inject offsets into hack.h
-      run: |
-        python3 scripts/inject_and_patch.py \
-          hack_offsets.env \
-          app/src/main/cpp/hack.h \
-          /dev/null
-
-    # ── 13. Rebuild com offsets reais ────────────────────────────────────────
-    - name: Rebuild MKMod with real offsets
-      run: |
-        set -e
-        cd build_mkmod
-        ninja -j$(nproc)
-        cp libMKMod.so ../mod_lib/lib/arm64-v8a/
 
     # ── 14. Descompilar APK ───────────────────────────────────────────────────
     - name: Decompile base APK
+      shell: bash
       run: |
-        apktool d base.apk -o mk_decompiled/ --no-res -q 2>&1 | tail -5 || \
-        apktool d base.apk -o mk_decompiled/ -q 2>&1 | tail -5
-        ls mk_decompiled/ | grep smali || true
+        set -euo pipefail
+        apktool d base.apk -o mk_decompiled/ --force -q
+        test -f mk_decompiled/AndroidManifest.xml
+        find mk_decompiled -maxdepth 1 -name 'smali*' -print
 
     # ── 15. Inject libs + patch smali ─────────────────────────────────────────
     - name: Inject libs + patch smali
       run: |
+        set -euo pipefail
         mkdir -p mk_decompiled/lib/arm64-v8a
         cp mod_lib/lib/arm64-v8a/libMKMod.so mk_decompiled/lib/arm64-v8a/
         cp app/src/main/cpp/Menu/libs/arm64-v8a/libMenu.so mk_decompiled/lib/arm64-v8a/
@@ -313,6 +327,7 @@ jobs:
     # ── 16. Patch manifest ────────────────────────────────────────────────────
     - name: Patch AndroidManifest
       run: |
+        set -euo pipefail
         MANIFEST=mk_decompiled/AndroidManifest.xml
         grep -q 'SYSTEM_ALERT_WINDOW' "$MANIFEST" || \
           sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
@@ -320,14 +335,17 @@ jobs:
 
     # ── 17. Recompilar APK ────────────────────────────────────────────────────
     - name: Recompile APK
+      shell: bash
       run: |
-        apktool b mk_decompiled/ -o mk_modded.apk --use-aapt2 2>&1 | tail -10 || \
-        apktool b mk_decompiled/ -o mk_modded.apk 2>&1 | tail -10
+        set -euo pipefail
+        apktool b mk_decompiled/ -o mk_modded.apk --use-aapt2
+        test -s mk_modded.apk
         ls -lh mk_modded.apk
 
     # ── 18. Assinar APK ───────────────────────────────────────────────────────
     - name: Sign APK
       run: |
+        set -euo pipefail
         keytool -genkey -v \
           -keystore mk.keystore -alias mk \
           -keyalg RSA -keysize 2048 -validity 3650 \
@@ -357,6 +375,7 @@ jobs:
       with:
         name: libgame-so-1449740
         path: libgame.so
+        if-no-files-found: ignore
         retention-days: 7
 
     - name: Upload offsets report
@@ -364,10 +383,12 @@ jobs:
       with:
         name: offsets-report
         path: hack_offsets.env
+        if-no-files-found: ignore
         retention-days: 7
 
  
     - name: Build summary
+      if: always()
       run: |
         echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
