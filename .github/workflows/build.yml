@@ -1,4 +1,4 @@
-name: MK Mod Build — XAPK UE4 Smali Fix v7
+name: MK Mod Build — XAPK UE4 Inject Fix v8
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - Smali Fix V7
+    - name: Confirmar versao do workflow - Inject Fix V8
       run: |
-        echo "::notice::SMALI FIX V7 ATIVO"
+        echo "::notice::INJECT FIX V8 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -403,52 +403,83 @@ jobs:
         test -s hack_offsets.env || { echo "::error::Scanner nao gerou offsets para $GAME_LIB_NAME ($GAME_ENGINE)."; exit 1; }
         cat hack_offsets.env
 
-    # ── 12. Atualizar somente hack.h (SEM smali nesta etapa) ────────────────
-    - name: Update hack.h offsets only [V7]
+    # ── 12. Atualizar offsets de forma conservadora ───────────────────────
+    - name: Apply detected offsets safely - supports zero and multiple formats [V8]
       shell: bash
       run: |
         set -euo pipefail
-        # Atualiza SOMENTE o header. Nao roda o patch de smali antes do apktool.
-        python3 - <<'PYOFFSETS'
+        python3 - <<'PYOFFSETS8'
         from pathlib import Path
         import re
-
+        import sys
+        
         env = Path('hack_offsets.env')
         header = Path('app/src/main/cpp/hack.h')
         if not env.is_file() or not header.is_file():
-            raise SystemExit('::error::hack_offsets.env ou hack.h ausente')
+            sys.exit('::error::hack_offsets.env ou app/src/main/cpp/hack.h ausente')
+        
         values = {}
-        for raw in env.read_text().splitlines():
-            raw = raw.strip()
-            if not raw or raw.startswith('#'):
+        for line_number, raw in enumerate(env.read_text(encoding='utf-8-sig').splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
                 continue
-            m = re.fullmatch(r'(OFFSET_[A-Za-z0-9_]+)\s*=\s*(0[xX][0-9a-fA-F]+|\d+)', raw)
-            if not m:
-                raise SystemExit(f'::error::Formato de offset invalido: {raw}')
-            values[m[1]] = m[2]
+            match = re.fullmatch(r'(OFFSET_[A-Za-z0-9_]+)\s*=\s*(0[xX][0-9a-fA-F]+|\d+)(?:\s*#.*)?', line)
+            if not match:
+                sys.exit(f'::error::Offset invalido na linha {line_number}: {line}')
+            values[match[1]] = int(match[2], 0)
         if not values:
-            raise SystemExit('::error::Nenhum OFFSET_ encontrado em hack_offsets.env')
-
-        source = header.read_text()
+            sys.exit('::error::Scanner nao gerou nomes OFFSET_')
+        
+        print(f'[offset] {len(values)} offsets informados pelo scanner')
         for key, value in values.items():
-            # Atribuicao numerica (#define, constexpr, static uintptr_t, etc.)
-            pattern = rf'(?m)^(\s*(?:#\s*define\s+{re.escape(key)}\s+|[^\n;]*\b{re.escape(key)}\s*=\s*))(0[xX][0-9a-fA-F]+|\d+)(?=\s*(?:;|//|/\*|$))'
-            matches = list(re.finditer(pattern, source))
-            if len(matches) == 1:
-                source = source[:matches[0].start(2)] + value + source[matches[0].end(2):]
-                print(f'[offset] {key} = {value} (atualizado no hack.h)')
-            elif len(matches) > 1:
-                raise SystemExit(f'::error::Multiplas definicoes numericas de {key} em hack.h; revisar codigo')
-            elif re.search(rf'\b{re.escape(key)}\b', source):
-                raise SystemExit(f'::error::{key} existe em hack.h, mas com formato desconhecido; revisar codigo')
+            print(f'[offset] {key} = {value:#x}')
+        
+        # Zero e um marcador de "nao encontrado", e nunca um endereco funcional.
+        # Sem offsets reais, nao sobrescrever valores do projeto e nem fabricar hooks.
+        nonzero = {name: value for name, value in values.items() if value != 0}
+        if not nonzero:
+            print('::warning::Todos os offsets sao 0x0. Scanner sem resultados validos para esta versao de UE4.')
+            print('::warning::hack.h preservado sem alteracoes. Nenhum hook real foi configurado nesta etapa.')
+            sys.exit(0)
+        
+        source = header.read_text(encoding='utf-8')
+        replaced = []
+        inserted = []
+        for key, value in nonzero.items():
+            new_value = f'0x{value:X}'
+            escaped = re.escape(key)
+            # Aceita macros: #define OFFSET_FOO 0x0, (0x0), 0ULL e equivalentes.
+            macro = re.compile(rf'(?m)^(?P<prefix>\s*#\s*define\s+{escaped}[ \t]+)(?P<open>\(?[ \t]*)(?P<num>0[xX][0-9a-fA-F]+|\d+)(?P<suffix>(?:[uUlL]{{1,3}})?[ \t]*\)?)(?=[ \t]*(?://|/\*|$))')
+            # Aceita inicializadores diretos: uintptr_t OFFSET_FOO = 0; e = {0};
+            variable = re.compile(rf'(?m)^(?P<prefix>[^\n]*\b{escaped}[ \t]*=[ \t]*\(?\{{?[ \t]*)(?P<num>0[xX][0-9a-fA-F]+|\d+)(?P<suffix>[uUlL]{{0,3}})(?=[ \t]*[\)}};])')
+            candidates = []
+            for pattern in (macro, variable):
+                for match in pattern.finditer(source):
+                    ln = source.rfind('\n', 0, match.start()) + 1
+                    prefix = source[ln:match.start()]
+                    if prefix.lstrip().startswith(('//', '*', '/*')):
+                        continue
+                    candidates.append((match.start('num'), match.end('num')))
+            candidates = sorted(set(candidates))
+            if len(candidates) == 1:
+                begin, end = candidates[0]
+                source = source[:begin] + new_value + source[end:]
+                replaced.append(key)
+                print(f'[offset] Atualizado {key} -> {new_value}')
+            elif len(candidates) > 1:
+                sys.exit(f'::error::{key} possui mais de uma definicao numerica em hack.h; alterar automaticamente seria ambiguo.')
+            elif re.search(rf'\b{escaped}\b', source):
+                # Sem conhecer a representacao da variavel nao existe um patch generico seguro.
+                matches = [s.strip() for s in source.splitlines() if re.search(rf'\b{escaped}\b', s)][:4]
+                sys.exit(f'::error::{key} tem offset nao-zero, mas uma definicao desconhecida em hack.h: {matches}')
             else:
-                # Preserva compatibilidade com headers que usam macros e ainda nao definem a chave.
-                source += f'\n#ifndef {key}\n#define {key} {value}\n#endif\n'
-                print(f'[offset] {key} = {value} (macro adicionada)')
-        header.write_text(source)
-        if all(int(value, 0) == 0 for value in values.values()):
-            print('::warning::Todos os offsets encontrados sao 0x0. A compilacao pode terminar, mas o scanner NAO descobriu offsets funcionais para UE4.')
-        PYOFFSETS
+                source += f'\n#ifndef {key}\n#define {key} {new_value}\n#endif\n'
+                inserted.append(key)
+                print(f'[offset] Macro {key} criada -> {new_value}')
+        
+        header.write_text(source, encoding='utf-8')
+        print(f'[offset] Resultado: {len(replaced)} alterados, {len(inserted)} criados, {len(values) - len(nonzero)} zeros ignorados')
+        PYOFFSETS8
 
     # ── 13. Build MKMod.so (com offsets injetados) ──────────────────────────
     - name: Build MKMod for detected ABI [V6]
@@ -468,7 +499,7 @@ jobs:
 
 
     # ── 14. Descompilar APK ───────────────────────────────────────────────────
-    - name: Decompile base APK
+    - name: Decompile base APK for manifest and smali [V8]
       shell: bash
       run: |
         set -euo pipefail
@@ -476,133 +507,178 @@ jobs:
         test -f mk_decompiled/AndroidManifest.xml
         find mk_decompiled -maxdepth 1 -name 'smali*' -print
 
-    # ── 15. Patch smali na entrada REAL indicada pelo AndroidManifest ───────
-    - name: Inject MKMod load into manifest entry class [V7]
+    # ── 15. Procurar a Activity/Application REAL em todos os APKs com DEX ─
+    - name: Locate and inject MKMod into the correct APK split [V8]
       shell: bash
       run: |
         set -euo pipefail
-        # Escolher pelo AndroidManifest real: jogos UE4 nao precisam ter MainActivity.smali.
-        cat > /tmp/patch_mkmod_smali.py <<'PYSMALI'
+        python3 - <<'PYSMALI8'
         from pathlib import Path
         from xml.etree import ElementTree as ET
+        import json
+        import os
         import re
-
-        root = Path('mk_decompiled')
-        manifest = root / 'AndroidManifest.xml'
+        import subprocess
+        import zipfile
+        
+        base_dir = Path('mk_decompiled')
+        manifest = base_dir / 'AndroidManifest.xml'
         if not manifest.is_file():
-            raise SystemExit('::error::APK precisa ser descompilado ANTES de aplicar o patch Smali')
-
+            raise SystemExit('::error::APK principal ainda nao foi descompilado')
         try:
-            tree = ET.parse(manifest)
-        except ET.ParseError as e:
-            raise SystemExit(f'::error::AndroidManifest.xml invalido: {e}')
-
-        m = tree.getroot()
+            root = ET.parse(manifest).getroot()
+        except ET.ParseError as exc:
+            raise SystemExit(f'::error::Manifest invalido: {exc}')
         android = '{http://schemas.android.com/apk/res/android}'
-        package = m.get('package', '')
-        app = m.find('application')
+        package = root.get('package', '')
+        app = root.find('application')
         if app is None:
-            raise SystemExit('::error::Manifest sem tag application')
-
+            raise SystemExit('::error::Manifest sem application')
+        
         def fqcn(name):
             if not name:
                 return ''
             if name.startswith('.'):
                 return package + name
             if '.' not in name:
-                return package + '.' + name
+                return package + '.' + name if package else name
             return name
-
-        launchers = []
-        for tag in ('activity', 'activity-alias'):
-            for entry in app.findall(tag):
-                for intent in entry.findall('intent-filter'):
-                    actions = {x.get(android+'name') for x in intent.findall('action')}
-                    categories = {x.get(android+'name') for x in intent.findall('category')}
-                    if ('android.intent.action.MAIN' in actions and
-                        'android.intent.category.LAUNCHER' in categories):
-                        clazz = entry.get(android+'targetActivity') if tag == 'activity-alias' else entry.get(android+'name')
-                        launchers.append(fqcn(clazz))
-
-        names = list(dict.fromkeys(x for x in launchers + [fqcn(app.get(android+'name'))] if x))
-        if not names:
-            raise SystemExit('::error::Manifest nao informa Activity de entrada nem Application propria')
-
-        smali_roots = [p for p in root.iterdir() if p.is_dir() and p.name.startswith('smali')]
-        if not smali_roots:
-            raise SystemExit('::error::APK descompilado sem codigo Smali; procure o split contendo classes.dex')
-
+        
+        entry_points = []
+        def add(name, kind):
+            name = fqcn(name)
+            if name and (name, kind) not in entry_points:
+                entry_points.append((name, kind))
+        
+        add(app.get(android + 'name'), 'Application')
+        for activity in list(app.findall('activity')) + list(app.findall('activity-alias')):
+            filters = activity.findall('intent-filter')
+            launcher = any(
+                any(x.get(android+'name') == 'android.intent.action.MAIN' for x in f.findall('action')) and
+                any(x.get(android+'name') in ('android.intent.category.LAUNCHER', 'android.intent.category.LEANBACK_LAUNCHER') for x in f.findall('category'))
+                for f in filters
+            )
+            if launcher:
+                if activity.tag == 'activity-alias':
+                    add(activity.get(android+'targetActivity'), 'Activity')
+                else:
+                    add(activity.get(android+'name'), 'Activity')
+        # Se nao houver launcher declarado, Activity normal e ultima tentativa segura.
+        if not entry_points:
+            for activity in app.findall('activity'):
+                add(activity.get(android+'name'), 'Activity')
+        
+        if not entry_points:
+            raise SystemExit('::error::Nao existe Application customizada nem Activity localizavel no Manifest')
+        print('[smali] Entradas candidatas do Manifest:', entry_points)
+        
+        base_apk = Path(os.environ['BASE_APK_PATH'])
+        all_apks = sorted(Path('xapk_contents').rglob('*.apk'))
+        if not any(x == base_apk for x in all_apks):
+            raise SystemExit('::error::BASE_APK_PATH nao pertence ao XAPK')
+        
+        def count_dex(path):
+            with zipfile.ZipFile(path) as z:
+                return sum(re.fullmatch(r'classes\d*\.dex', Path(n).name) is not None for n in z.namelist())
+        
+        candidates = [(base_apk, base_dir)]
+        other_apks = sorted((a for a in all_apks if a != base_apk and count_dex(a)), key=lambda p: -count_dex(p))
+        for a in other_apks:
+            candidates.append((a, Path('mk_extra_decoded') / a.stem))
+        
+        
+        def locate(directory, classname):
+            relative = Path(*classname.split('.')).with_suffix('.smali')
+            for folder in sorted(directory.glob('smali*')):
+                if folder.is_dir():
+                    path = folder / relative
+                    if path.is_file():
+                        return path
+            return None
+        
         selected = None
-        for name in names:
-            relative = Path(*name.split('.')).with_suffix('.smali')
-            for folder in smali_roots:
-                found = folder / relative
-                if found.is_file():
-                    selected = (found, name, name in launchers)
+        for apk, directory in candidates:
+            if directory != base_dir:
+                print(f'[smali] Buscando classes.dex em split: {apk}')
+                cmd = ['apktool', 'd', '--force', '--quiet', str(apk), '-o', str(directory)]
+                process = subprocess.run(cmd, text=True, capture_output=True)
+                if process.returncode != 0:
+                    print(f'::warning::Nao foi possivel descompilar {apk}: {process.stderr[-1000:]}')
+                    continue
+            for name, kind in entry_points:
+                path = locate(directory, name)
+                if path:
+                    selected = (apk, directory, path, name, kind)
                     break
             if selected:
                 break
-        if selected is None:
-            raise SystemExit('::error::Nenhuma classe de entrada do Manifest foi encontrada no Smali. Candidatas: '+', '.join(names))
-
-        path, name, is_activity = selected
-        source = path.read_text()
-        class_match = re.search(r'(?m)^\.class\s+.*?\s+(L[^;]+;)\s*$', source)
+        
+        if not selected:
+            message = ', '.join(name for name, _ in entry_points)
+            raise SystemExit(f'::error::Nenhuma classe de entrada encontrada nos APKs com DEX: {message}. Precisa identificar onde o codigo Java do app reside.')
+        
+        apk, directory, path, name, kind = selected
+        source = path.read_text(encoding='utf-8')
+        class_match = re.search(r'(?m)^\.class\s+[^\n]*\s+(L[^;]+;)\s*$', source)
         super_match = re.search(r'(?m)^\.super\s+(L[^;]+;)\s*$', source)
-        if not class_match or not super_match:
-            raise SystemExit('::error::Classe ou superclass Smali nao identificada em '+str(path))
+        if not (class_match and super_match):
+            raise SystemExit(f'::error::Descritores Smali invalidos em {path}')
         class_desc, super_desc = class_match[1], super_match[1]
-        method_sig = 'onCreate(Landroid/os/Bundle;)V' if is_activity else 'onCreate()V'
+        signature = 'onCreate(Landroid/os/Bundle;)V' if kind == 'Activity' else 'onCreate()V'
         helper = 'mkmod$load()V'
         call = f'    invoke-static {{}}, {class_desc}->{helper}'
-
-        if helper in source or 'const-string v0, "MKMod"' in source:
-            if call in source:
-                print('[smali] patch ja aplicado em', path)
-                raise SystemExit(0)
-            raise SystemExit('::error::Loader MKMod ja existe, mas nao esta corretamente conectado ao onCreate')
-
-        # Usar helper sem argumentos evita mexer nos registradores do metodo original.
-        block = re.search(r'(?m)^\.method[^\n]*\b'+re.escape(method_sig)+r'\s*\n.*?^\.end method\s*$', source, re.S|re.M)
-        if block:
-            method = block.group(0)
-            regs = re.search(r'(?m)^\s*\.(?:locals|registers)\s+\d+\s*$', method)
-            if not regs:
-                raise SystemExit('::error::onCreate sem .locals ou .registers em '+str(path))
-            # Inserir depois do super.onCreate, quando presente, para preservar inicializacao.
-            supercall = re.search(r'(?m)^\s*invoke-super[^\n]*->onCreate\([^\n]*\)V\s*$', method)
-            position = supercall.end() if supercall else regs.end()
-            method = method[:position] + '\n' + call + method[position:]
-            source = source[:block.start()] + method + source[block.end():]
+        
+        if helper in source:
+            if call not in source or 'loadLibrary(Ljava/lang/String;)V' not in source:
+                raise SystemExit('::error::Patch anterior incompleto no Smali; precisa de reparo manual')
+            print(f'[smali] Injeção ja presente e validada: {path}')
         else:
-            # Classes que herdam onCreate nao possuem metodo proprio: criar override valido.
-            if is_activity:
-                body = ('.method public onCreate(Landroid/os/Bundle;)V\n'
+            method_pattern = re.compile(r'(?ms)^\.method\b[^\n]*\b'+re.escape(signature)+r'[ \t]*\n.*?^\.end method[ \t]*$')
+            block = method_pattern.search(source)
+            if block:
+                method = block.group(0)
+                registers = re.search(r'(?m)^[ \t]*\.(?:locals|registers)[ \t]+\d+[ \t]*$', method)
+                if not registers:
+                    raise SystemExit(f'::error::{signature} sem declaracao de registradores em {path}')
+                superclass_call = re.search(r'(?m)^[ \t]*invoke-super(?:/range)?\b[^\n]*->onCreate\([^\n]*\)V[ \t]*$', method)
+                insert_at = superclass_call.end() if superclass_call else registers.end()
+                method = method[:insert_at] + '\n' + call + method[insert_at:]
+                source = source[:block.start()] + method + source[block.end():]
+            else:
+                if kind == 'Activity':
+                    override = (
+                        '.method public onCreate(Landroid/os/Bundle;)V\n'
                         '    .locals 0\n'
                         f'    invoke-super {{p0, p1}}, {super_desc}->onCreate(Landroid/os/Bundle;)V\n'
-                        f'{call}\n    return-void\n.end method\n')
-            else:
-                body = ('.method public onCreate()V\n'
+                        f'{call}\n'
+                        '    return-void\n.end method\n'
+                    )
+                else:
+                    override = (
+                        '.method public onCreate()V\n'
                         '    .locals 0\n'
                         f'    invoke-super {{p0}}, {super_desc}->onCreate()V\n'
-                        f'{call}\n    return-void\n.end method\n')
-            source += '\n' + body
-
-        source += ('\n.method private static mkmod$load()V\n'
-                   '    .locals 1\n'
-                   '    const-string v0, "MKMod"\n'
-                   '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
-                   '    return-void\n'
-                   '.end method\n')
-        path.write_text(source)
-        if call not in source or 'loadLibrary(Ljava/lang/String;)V' not in source:
-            raise SystemExit('::error::Validacao da injeção Smali falhou')
-        print(f'[smali] Entrada do Manifest: {name} ({"Activity" if is_activity else "Application"})')
-        print(f'[smali] Biblioteca: libMKMod.so / arquitetura definida pelo split nativo')
-        print(f'[smali] Patch aplicado em {path} (sem alterar registradores originais)')
-        PYSMALI
-        python3 /tmp/patch_mkmod_smali.py
-
+                        f'{call}\n'
+                        '    return-void\n.end method\n'
+                    )
+                source += '\n' + override
+            source += (
+                '\n.method private static mkmod$load()V\n'
+                '    .locals 1\n'
+                '    const-string v0, "MKMod"\n'
+                '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+                '    return-void\n.end method\n'
+            )
+            if source.count('loadLibrary(Ljava/lang/String;)V') < 1 or call not in source:
+                raise SystemExit('::error::Validacao do loader falhou')
+            path.write_text(source, encoding='utf-8')
+            print(f'[smali] Inject realizado em {path}')
+        
+        metadata = {'source_apk': str(apk), 'decoded_path': str(directory), 'class': name, 'kind': kind}
+        Path('mkmod_injection.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+        print(f'[smali] APK injetado: {apk}; classe: {name}; tipo: {kind}')
+        print('[smali] O carregamento so sera efetivo se libMKMod.so for funcional e compativel com o jogo.')
+        PYSMALI8
 
     # ── 16. Patch manifest ────────────────────────────────────────────────────
     - name: Patch AndroidManifest
@@ -613,17 +689,41 @@ jobs:
           sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
         echo "Manifest OK"
 
-    # ── 17. Recompilar APK ────────────────────────────────────────────────────
-    - name: Recompile APK
+    # ── 17. Recompilar todo APK alterado (base + split que recebeu o loader) ─
+    - name: Recompile patched APKs and verify dex [V8]
       shell: bash
       run: |
         set -euo pipefail
-        apktool b mk_decompiled/ -o mk_modded.apk --use-aapt2
-        test -s mk_modded.apk
-        ls -lh mk_modded.apk
+        test -s mkmod_injection.json
+        mkdir -p rebuilt_apks
+        apktool b mk_decompiled/ -o "rebuilt_apks/$(basename "$BASE_APK_PATH")" --use-aapt2
+        python3 - <<'PYREBUILD8'
+        from pathlib import Path
+        import json, os, subprocess, zipfile
+
+        info = json.loads(Path('mkmod_injection.json').read_text())
+        base = Path(os.environ['BASE_APK_PATH'])
+        target = Path(info['source_apk'])
+        if target != base:
+            output = Path('rebuilt_apks') / target.name
+            command = ['apktool', 'b', info['decoded_path'], '-o', str(output), '--use-aapt2']
+            print('Recompilando split injetado:', target, flush=True)
+            subprocess.run(command, check=True)
+        for source_apk in (base, target):
+            output = Path('rebuilt_apks') / source_apk.name
+            if not output.is_file() or output.stat().st_size < 100:
+                raise SystemExit(f'::error::APK recompilado ausente: {output}')
+            with zipfile.ZipFile(source_apk) as original, zipfile.ZipFile(output) as rebuilt:
+                original_has_dex = any(n.startswith('classes') and n.endswith('.dex') for n in original.namelist())
+                rebuilt_has_dex = any(n.startswith('classes') and n.endswith('.dex') for n in rebuilt.namelist())
+                if (original_has_dex or source_apk == target) and not rebuilt_has_dex:
+                    raise SystemExit(f'::error::APK recompilado perdeu classes.dex: {output}')
+            print(f'OK: {output} / DEX={rebuilt_has_dex} / {output.stat().st_size:,} bytes')
+        print(f'Injecao persistira no APK: {target.name}')
+        PYREBUILD8
 
     # ── 18. Re-assinar TODOS os splits e preservar o conjunto ───────────────
-    - name: Package + sign complete split APK set [V6]
+    - name: Package + sign full APK set with injected split [V8]
       shell: bash
       run: |
         set -euo pipefail
@@ -634,110 +734,58 @@ jobs:
         mkdir -p unsigned_apks signed_apks aligned_apks
         python3 - <<'PYPACK'
         from pathlib import Path
-        import os, shutil, zipfile
+        import json, os, shutil, zipfile
         apks = sorted(Path('xapk_contents').rglob('*.apk'))
         base = Path(os.environ['BASE_APK_PATH'])
         native_apk = Path(os.environ['GAME_LIB_APK'])
         abi = os.environ['TARGET_ABI']
-        if not apks: raise SystemExit('::error::Nenhum APK encontrado.')
-        # Quando a lib da engine reside em config.armeabi_v7a.apk, o mod nativo
-        # tambem precisa estar nesse mesmo conjunto de splits e ABI.
+        injected = json.loads(Path('mkmod_injection.json').read_text())
+        patched_apk = Path(injected['source_apk'])
+        if not apks or base not in apks or native_apk not in apks or patched_apk not in apks:
+            raise SystemExit('::error::Informacoes do conjunto split inconsistentes')
         if not Path(f'mod_lib/lib/{abi}/libMKMod.so').is_file():
-            raise SystemExit(f'::error::libMKMod.so para {abi} ausente.')
+            raise SystemExit(f'::error::libMKMod.so para {abi} ausente')
         for src in apks:
             dst = Path('unsigned_apks') / src.name
-            if src == base:
-                shutil.copyfile('mk_modded.apk', dst)
+            rebuilt = Path('rebuilt_apks') / src.name
+            if src == base or src == patched_apk:
+                if not rebuilt.is_file():
+                    raise SystemExit(f'::error::APK alterado nao foi reconstruido: {rebuilt}')
+                shutil.copyfile(rebuilt, dst)
             else:
                 shutil.copyfile(src, dst)
             if src == native_apk:
-                # Reconstruir ZIP para substituir entradas existentes de modo seguro.
-                tmp = dst.with_suffix('.tmp')
+                temp = dst.with_suffix('.tmp')
                 replacements = {
                     f'lib/{abi}/libMKMod.so': Path(f'mod_lib/lib/{abi}/libMKMod.so'),
                     f'lib/{abi}/libMenu.so': Path(f'app/src/main/cpp/Menu/libs/{abi}/libMenu.so'),
                 }
-                with zipfile.ZipFile(dst, 'r') as orig, zipfile.ZipFile(tmp, 'w') as out:
-                    for item in orig.infolist():
-                        if item.filename in replacements: continue
-                        out.writestr(item, orig.read(item.filename))
-                    for member, path in replacements.items():
-                        if not path.is_file(): raise SystemExit(f'::error::Falta {path}')
-                        out.write(path, arcname=member, compress_type=zipfile.ZIP_STORED)
-                os.replace(tmp, dst)
-            print('PREPARADO', dst, '(base)' if src == base else '(split)')
+                with zipfile.ZipFile(dst, 'r') as original, zipfile.ZipFile(temp, 'w') as output:
+                    for item in original.infolist():
+                        if item.filename in replacements:
+                            continue
+                        output.writestr(item, original.read(item.filename))
+                    for member, file in replacements.items():
+                        if not file.is_file():
+                            raise SystemExit(f'::error::Biblioteca requerida ausente: {file}')
+                        output.write(file, arcname=member, compress_type=zipfile.ZIP_STORED)
+                os.replace(temp, dst)
+            with zipfile.ZipFile(dst) as archive:
+                if src == native_apk:
+                    for member in (f'lib/{abi}/libMKMod.so', f'lib/{abi}/libMenu.so'):
+                        if member not in archive.namelist():
+                            raise SystemExit(f'::error::Injecao da biblioteca falhou: {member}')
+                if src == patched_apk and not any(n.startswith('classes') and n.endswith('.dex') for n in archive.namelist()):
+                    raise SystemExit('::error::APK da classe Smali perdeu classes.dex')
+            print('PREPARADO', src.name,
+                  '[base]' if src == base else '',
+                  '[smali]' if src == patched_apk else '',
+                  '[lib]' if src == native_apk else '')
+        print('::notice::Pacote inclui APK principal, codigo Smali injetado e bibliotecas nativas da arquitetura correta.')
         PYPACK
         # PackageManager recusa APKs divididos assinados com certificados diferentes.
         for apk in unsigned_apks/*.apk; do
           name="$(basename "$apk")"
           zipalign -p -f 4 "$apk" "aligned_apks/$name"
           apksigner sign --ks mk.keystore --ks-pass pass:mkmodpass \
-            --key-pass pass:mkmodpass --ks-key-alias mk \
-            --out "signed_apks/$name" "aligned_apks/$name"
-          apksigner verify "signed_apks/$name"
-        done
-        COUNT="$(find signed_apks -maxdepth 1 -type f -name '*.apk' | wc -l)"
-        echo "APKs assinados: $COUNT"
-        if [ "$COUNT" -gt 1 ]; then
-          # Artefato .apks com as partes instalaveis via adb install-multiple.
-          (cd signed_apks && zip -q -0 ../mk_final.apks ./*.apk)
-          test -s mk_final.apks
-          echo '::notice::Gerado mk_final.apks (multiplos APKs; NAO instalar apenas o base).'
-        else
-          cp signed_apks/*.apk mk_final.apk
-          echo '::notice::Gerado mk_final.apk unico.'
-        fi
-        ls -lh mk_final.apk mk_final.apks 2>/dev/null || true
-
-    # ── 19. Upload artifacts ──────────────────────────────────────────────────
-    - name: Upload signed MK APK set
-      uses: actions/upload-artifact@v4
-      with:
-        name: MK-Mobile-MODDED-signed-splits
-        path: |
-          mk_final.apk
-          mk_final.apks
-          signed_apks/*.apk
-        if-no-files-found: error
-        retention-days: 7
-
-    - name: Upload game native library
-      uses: actions/upload-artifact@v4
-      with:
-        name: original-game-library
-        path: |
-          libgame.so
-          libUE4.so
-          libUnreal.so
-          libil2cpp.so
-          libunity.so
-          libmain.so
-        if-no-files-found: ignore
-        retention-days: 7
-
-    - name: Upload offsets report
-      uses: actions/upload-artifact@v4
-      with:
-        name: offsets-report
-        path: hack_offsets.env
-        if-no-files-found: ignore
-        retention-days: 7
-
  
-    - name: Build summary
-      if: always()
-      run: |
-        echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
-        if [ -f mk_final.apks ]; then
-          APK_SIZE=$(du -h mk_final.apks | cut -f1)
-        elif [ -f mk_final.apk ]; then
-          APK_SIZE=$(du -h mk_final.apk | cut -f1)
-        else
-          APK_SIZE="N/A"
-        fi
-        echo "APK: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
-        echo "Game: ${GAME_LIB_NAME:-unknown} / ABI: ${TARGET_ABI:-unknown}" >> "$GITHUB_STEP_SUMMARY"
-        if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
