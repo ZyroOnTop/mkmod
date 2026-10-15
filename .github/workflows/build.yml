@@ -788,4 +788,62 @@ jobs:
           name="$(basename "$apk")"
           zipalign -p -f 4 "$apk" "aligned_apks/$name"
           apksigner sign --ks mk.keystore --ks-pass pass:mkmodpass \
+
  
+    # ── 19. Upload artifacts ──────────────────────────────────────────────────
+    - name: Upload signed MK APK set
+      uses: actions/upload-artifact@v4
+      with:
+        name: MK-Mobile-MODDED-signed-splits
+        path: |
+          mk_final.apk
+          mk_final.apks
+          signed_apks/*.apk
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Upload game native library
+      uses: actions/upload-artifact@v4
+      with:
+        name: original-game-library
+        path: |
+          libgame.so
+          libUE4.so
+          libUnreal.so
+          libil2cpp.so
+          libunity.so
+          libmain.so
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Upload offsets report
+      uses: actions/upload-artifact@v4
+      with:
+        name: offsets-report
+        path: hack_offsets.env
+        if-no-files-found: ignore
+        retention-days: 7
+
+ 
+    - name: Build summary
+      if: always()
+      run: |
+        echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        if [ -f mk_final.apks ]; then
+          APK_SIZE=$(du -h mk_final.apks | cut -f1)
+        elif [ -f mk_final.apk ]; then
+          APK_SIZE=$(du -h mk_final.apk | cut -f1)
+        else
+          APK_SIZE="N/A"
+        fi
+        echo "APK: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
+        echo "Game: ${GAME_LIB_NAME:-unknown} / ABI: ${TARGET_ABI:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f mkmod_injection.json ]; then cat mkmod_injection.json >> "$GITHUB_STEP_SUMMARY"; fi
+        if [ -f hack_offsets.env ] && ! grep -Eq '=0[xX]?[1-9a-fA-F]' hack_offsets.env; then
+          echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
+        
