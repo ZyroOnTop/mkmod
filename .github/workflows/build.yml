@@ -1,4 +1,4 @@
-name: MK Mod Build — 7.4.0 — Dobby Stable + XAPK fallback v5
+name: MK Mod Build — XAPK ABI-aware UE4 v6
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - DOBBY STABLE V4
+    - name: Confirmar versao do workflow - XAPK UE4 V6
       run: |
-        echo "::notice::DOBBY STABLE V4 ATIVO"
+        echo "::notice::XAPK UE4 V6 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -170,6 +170,85 @@ jobs:
         unzip -tq mk740.xapk | tail -2
         ls -lh mk740.xapk
 
+    # Detectar base, engine e arquitetura antes de compilar dependencias.
+    - name: Extract XAPK + detect game library and ABI [V6]
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p xapk_contents extracted
+        unzip -q mk740.xapk -d xapk_contents/
+        python3 - <<'PYDETECT'
+        from pathlib import Path
+        import os, shutil, zipfile
+        apks = sorted(Path('xapk_contents').rglob('*.apk'))
+        if not apks:
+            raise SystemExit('::error::O XAPK nao contem arquivos APK.')
+        metadata = []
+        game_libraries = []
+        lib_priorities = ['libUE4.so', 'libUnreal.so', 'libil2cpp.so', 'libgame.so', 'libunity.so', 'libmain.so']
+        for apk in apks:
+            with zipfile.ZipFile(apk) as z:
+                names = set(z.namelist())
+                dex = sum(name.startswith('classes') and name.endswith('.dex') for name in names)
+                metadata.append((apk, dex))
+                for abi in ['arm64-v8a', 'armeabi-v7a']:
+                    for library in lib_priorities:
+                        member = f'lib/{abi}/{library}'
+                        if member in names:
+                            game_libraries.append((apk, member, abi, library))
+        print('APKs encontrados:')
+        for apk, dex in metadata:
+            print(f'  {apk} | DEX={dex}')
+        base = next((a for a, _ in metadata if a.name == 'com.wb.goog.mkx.apk'), None)
+        if base is None:
+            base = next((a for a, _ in metadata if a.name == 'base.apk'), None)
+        if base is None:
+            candidate_apks = [(a,d) for a,d in metadata if not a.name.startswith(('config.', 'split_config.'))]
+            if not candidate_apks:
+                raise SystemExit('::error::Nao foi possivel identificar o APK principal.')
+            base = max(candidate_apks, key=lambda item: (item[1], item[0].stat().st_size))[0]
+        shutil.copyfile(base, 'base.apk')
+        print(f'APK PRINCIPAL: {base}')
+        if not game_libraries:
+            raise SystemExit('::error::Nenhuma biblioteca de jogo conhecida encontrada nos APKs.')
+        # Nao misturar uma biblioteca ARMv7 com binarios ARM64.
+        game_libraries.sort(key=lambda hit: (
+            lib_priorities.index(hit[3]),
+            ['arm64-v8a','armeabi-v7a'].index(hit[2]),
+        ))
+        source_apk, member, abi, library = game_libraries[0]
+        with zipfile.ZipFile(source_apk) as z, z.open(member) as inp, open(library, 'wb') as out:
+            shutil.copyfileobj(inp, out)
+        # Alias APENAS para a interface do scanner legado (nao muda o binario/engine).
+        if library != 'libgame.so':
+            shutil.copyfile(library, 'libgame.so')
+        # Ler cabecalho ELF para rejeitar bibliotecas com arquitetura incorreta.
+        with open(library, 'rb') as f:
+            header = f.read(20)
+        elf_class = 2 if abi == 'arm64-v8a' else 1
+        if header[:4] != b'\x7fELF' or header[4] != elf_class:
+            raise SystemExit('::error::ELF invalido ou arquitetura divergente no XAPK.')
+        engine = 'UnrealEngine' if library in ('libUE4.so','libUnreal.so') else ('Unity' if library in ('libunity.so','libil2cpp.so') else 'Unknown')
+        clang_triple = 'aarch64-linux-android' if abi == 'arm64-v8a' else 'armv7a-linux-androideabi'
+        envs = {
+            'BASE_APK_PATH': str(base),
+            'TARGET_ABI': abi,
+            'GAME_LIB_NAME': library,
+            'GAME_ENGINE': engine,
+            'GAME_LIB_APK': str(source_apk),
+            'TARGET_CLANG_TRIPLE': clang_triple,
+        }
+        with open(os.environ['GITHUB_ENV'], 'a') as e:
+            for k, v in envs.items():
+                e.write(f'{k}={v}\n')
+        print(f'JOGO: {library}, engine={engine}, ABI={abi}, vindo de {source_apk}')
+        print('AVISO: libgame.so e um alias de compatibilidade para scanner, NAO outra engine.')
+        if engine == 'UnrealEngine':
+            print('::warning::Scanner original pode ter sido escrito para outra engine; offsets UE4 precisam de suporte proprio.')
+        PYDETECT
+        file libgame.so
+        ls -lh base.apk libgame.so
+
     # ── 2. Java 17 ───────────────────────────────────────────────────────────
     - name: Setup Java 17
       uses: actions/setup-java@v4
@@ -237,7 +316,7 @@ jobs:
         git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
 
     # ── 6. Dobby ARM64: fonte historica estavel, sem patch ELF ─────────────
-    - name: Build Dobby ARM64 from pinned working commit [V4]
+    - name: Build Dobby for detected game ABI [V6]
       shell: bash
       run: |
         set -euo pipefail
@@ -253,7 +332,7 @@ jobs:
         rm -rf build_arm64
         cmake -S . -B build_arm64 -G Ninja \
           -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_ABI="$TARGET_ABI" \
           -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
           -DCMAKE_BUILD_TYPE=Release \
           -DDOBBY_DEBUG=OFF \
@@ -270,47 +349,34 @@ jobs:
           echo '::error::libdobby.a nao contem DobbyHook.'
           exit 1
         }
-        mkdir -p libs/arm64-v8a
-        cp build_arm64/libdobby.a libs/arm64-v8a/libdobby.a
-        echo '::notice::Dobby estavel ARM64 compilado com sucesso!'
-        ls -lh libs/arm64-v8a/libdobby.a
+        mkdir -p "libs/$TARGET_ABI"
+        cp build_arm64/libdobby.a "libs/$TARGET_ABI/libdobby.a"
+        echo '::notice::Dobby compilado para ABI detectada!'
+        ls -lh "libs/$TARGET_ABI/libdobby.a"
 
-    # ── 7. LGL Menu (stub quando o upstream nao fornece libMenu.so) ──────────
-    - name: Build LGL Menu arm64-v8a
+    # ── 7. Menu ───────────────────────────────────────────────────────────────
+    - name: Build Menu link stub for detected ABI [V6]
+      shell: bash
       run: |
-        cd app/src/main/cpp/Menu
-        mkdir -p build_arm64 && cd build_arm64
-        cmake .. \
-          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a \
-          -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
-          -DCMAKE_BUILD_TYPE=Release \
-          -G Ninja || true
-        ninja -j$(nproc) 2>/dev/null || make -j$(nproc) 2>/dev/null || true
-
-        mkdir -p ../libs/arm64-v8a ../include
-        SO=$(find . -name 'libMenu.so' | head -1)
-        if [ -n "$SO" ]; then
-          cp "$SO" ../libs/arm64-v8a/libMenu.so
-          echo "Menu lib: $SO"
-        else
-          echo '::warning::LGL nao gerou libMenu.so. Criando somente stub para vinculacao; este stub NAO exibe menu funcional.'
-          cat > /tmp/menu_stub.cpp << 'STUB'
+        set -euo pipefail
+        # O repo LGL Android-Mod-Menu nao possui CMakeLists.txt na raiz;
+        # ele NAO e compilavel com cmake .. diretamente.
+        # Esse stub apenas resolve symbols do CMake do MKMod; nao fornece UI.
+        MENU_DIR="app/src/main/cpp/Menu"
+        mkdir -p "$MENU_DIR/libs/$TARGET_ABI" "$MENU_DIR/include"
+        cat > /tmp/menu_stub.cpp <<'STUB'
         #include <android/log.h>
         extern "C" {
-          void StartMenuThread(const char* t) { __android_log_print(2,"MKMenu","started: %s",t); }
+          void StartMenuThread(const char* t) { __android_log_print(2, "MKMenu", "started: %s", t); }
           bool GetToggleState(int id) { return false; }
           float GetSliderValue(int id) { return 1.0f; }
           void RegisterToggle(int id, const char* l, bool d) {}
           void RegisterSlider(int id, const char* l, float mn, float mx, float d) {}
         }
         STUB
-          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ \
-            -shared -fPIC -o ../libs/arm64-v8a/libMenu.so /tmp/menu_stub.cpp -llog
-          echo "Stub created."
-        fi
-
-        [ -f ../include/Menu.h ] || cat > ../include/Menu.h << 'INC'
+        "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${TARGET_CLANG_TRIPLE}${API_LEVEL}-clang++" \
+          -shared -fPIC -o "$MENU_DIR/libs/$TARGET_ABI/libMenu.so" /tmp/menu_stub.cpp -llog
+        cat > "$MENU_DIR/include/Menu.h" <<'INC'
         extern "C" {
           void StartMenuThread(const char* title);
           bool GetToggleState(int id);
@@ -319,66 +385,22 @@ jobs:
           void RegisterSlider(int id, const char* label, float min, float max, float def);
         }
         INC
-        ls -lh ../libs/arm64-v8a/
-
-    # ── 10. Extrair APK e libgame.so ──────────────────────────────────────────
-    - name: Extract APK and libgame.so
-      shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p xapk_contents extracted
-        unzip -q mk740.xapk -d xapk_contents/
-        mapfile -d '' APKS < <(find xapk_contents -type f -iname '*.apk' -print0)
-        if [ "${#APKS[@]}" -eq 0 ]; then
-          echo 'ERRO: XAPK nao contem APKs.'
-          exit 1
-        fi
-        BASE_APK=''
-        for apk in "${APKS[@]}"; do
-          if [ "$(basename "$apk")" = 'base.apk' ]; then BASE_APK="$apk"; break; fi
-        done
-        if [ -z "$BASE_APK" ]; then
-          for apk in "${APKS[@]}"; do
-            case "$(basename "$apk")" in split_*) ;; *) BASE_APK="$apk"; break ;; esac
-          done
-        fi
-        BASE_APK="${BASE_APK:-${APKS[0]}}"
-        cp "$BASE_APK" base.apk
-        echo "Base APK: $BASE_APK"
-
-        FOUND=0
-        for apk in "${APKS[@]}"; do
-          if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libgame.so' >/dev/null; then
-            unzip -p "$apk" lib/arm64-v8a/libgame.so > libgame.so
-            FOUND=1
-            echo "libgame.so extraida de: $apk"
-            break
-          fi
-        done
-        if [ "$FOUND" -ne 1 ]; then
-          echo 'ERRO: nenhum APK do XAPK possui lib/arm64-v8a/libgame.so.'
-          echo 'Bibliotecas encontradas:'
-          for apk in "${APKS[@]}"; do
-            echo "-- $apk"
-            unzip -Z1 "$apk" | grep -E '^lib/.*\.so$' | head -20 || true
-          done
-          exit 1
-        fi
-        test -s libgame.so
-        ls -lh base.apk libgame.so
-        if [ "${#APKS[@]}" -gt 1 ]; then
-          echo 'AVISO: XAPK com APKs split. Assinar somente o base.apk nao recria um APK universal.'
-        fi
+        echo '::warning::libMenu.so e STUB, nao exibe menu real. A interface LGL precisa ser integrada ao projeto nativo separadamente.'
+        ls -lh "$MENU_DIR/libs/$TARGET_ABI/libMenu.so"
 
     # ── 11. Scan offsets ──────────────────────────────────────────────────────
-    - name: Scan offsets from libgame.so
+    - name: Scan offsets from detected game library [V6]
       shell: bash
       run: |
         set -euo pipefail
-        test -s libgame.so || { echo 'libgame.so ausente'; exit 1; }
+        test -s libgame.so || { echo 'Biblioteca do jogo ausente'; exit 1; }
+        echo "Scanner: $GAME_LIB_NAME ($GAME_ENGINE / $TARGET_ABI)"
         test -f scripts/find_offsets.py || { echo 'scripts/find_offsets.py ausente'; exit 1; }
-        python3 scripts/find_offsets.py libgame.so
-        test -s hack_offsets.env || { echo 'Script nao gerou hack_offsets.env'; exit 1; }
+        python3 scripts/find_offsets.py libgame.so || {
+          echo "::error::Scanner nao conseguiu processar $GAME_LIB_NAME ($GAME_ENGINE). Pode precisar de suporte a Unreal Engine."
+          exit 1
+        }
+        test -s hack_offsets.env || { echo "::error::Scanner nao gerou offsets para $GAME_LIB_NAME ($GAME_ENGINE)."; exit 1; }
         cat hack_offsets.env
 
     # ── 12. Inject offsets no hack.h ─────────────────────────────────────────
@@ -392,20 +414,20 @@ jobs:
 
 
     # ── 13. Build MKMod.so (com offsets injetados) ──────────────────────────
-    - name: Build MKMod arm64-v8a
+    - name: Build MKMod for detected ABI [V6]
       shell: bash
       run: |
         set -euo pipefail
         cmake -S app/src/main/cpp -B build_mkmod -G Ninja \
           -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_ABI="$TARGET_ABI" \
           -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
           -DCMAKE_BUILD_TYPE=Release
         cmake --build build_mkmod --parallel 4
         test -s build_mkmod/libMKMod.so
-        mkdir -p mod_lib/lib/arm64-v8a
-        cp build_mkmod/libMKMod.so mod_lib/lib/arm64-v8a/
-        ls -lh mod_lib/lib/arm64-v8a/libMKMod.so
+        mkdir -p "mod_lib/lib/$TARGET_ABI"
+        cp build_mkmod/libMKMod.so "mod_lib/lib/$TARGET_ABI/"
+        ls -lh "mod_lib/lib/$TARGET_ABI/libMKMod.so"
 
 
     # ── 14. Descompilar APK ───────────────────────────────────────────────────
@@ -417,21 +439,19 @@ jobs:
         test -f mk_decompiled/AndroidManifest.xml
         find mk_decompiled -maxdepth 1 -name 'smali*' -print
 
-    # ── 15. Inject libs + patch smali ─────────────────────────────────────────
-    - name: Inject libs + patch smali
+    # ── 15. Patch smali no APK base ──────────────────────────────────────────
+    - name: Patch base APK smali [V6]
+      shell: bash
       run: |
         set -euo pipefail
-        mkdir -p mk_decompiled/lib/arm64-v8a
-        cp mod_lib/lib/arm64-v8a/libMKMod.so mk_decompiled/lib/arm64-v8a/
-        cp app/src/main/cpp/Menu/libs/arm64-v8a/libMenu.so mk_decompiled/lib/arm64-v8a/
-        ls -lh mk_decompiled/lib/arm64-v8a/
+        # A biblioteca nativa vai para o split correto durante o empacotamento,
+        # nao para uma arquitetura arm64-v8a que este XAPK nao possui.
         python3 scripts/inject_and_patch.py \
           hack_offsets.env \
           app/src/main/cpp/hack.h \
           mk_decompiled/
 
-
-    # ── 16. Patch manifest ────────────────────────────────────────────────────
+     # ── 16. Patch manifest ────────────────────────────────────────────────────
     - name: Patch AndroidManifest
       run: |
         set -euo pipefail
@@ -449,39 +469,96 @@ jobs:
         test -s mk_modded.apk
         ls -lh mk_modded.apk
 
-    # ── 18. Assinar APK ───────────────────────────────────────────────────────
-    - name: Sign APK
+    # ── 18. Re-assinar TODOS os splits e preservar o conjunto ───────────────
+    - name: Package + sign complete split APK set [V6]
+      shell: bash
       run: |
         set -euo pipefail
-        keytool -genkey -v \
-          -keystore mk.keystore -alias mk \
-          -keyalg RSA -keysize 2048 -validity 3650 \
+        keytool -genkey \
+          -keystore mk.keystore -alias mk -keyalg RSA -keysize 2048 -validity 3650 \
           -storepass mkmodpass -keypass mkmodpass \
-          -dname "CN=MKMod,O=Mod,C=BR" -noprompt
-        zipalign -v 4 mk_modded.apk mk_aligned.apk
-        apksigner sign \
-          --ks mk.keystore \
-          --ks-pass pass:mkmodpass \
-          --key-pass pass:mkmodpass \
-          --ks-key-alias mk \
-          --out mk_final.apk \
-          mk_aligned.apk
-        apksigner verify mk_final.apk && echo "Signature OK"
-        ls -lh mk_final.apk
+          -dname "CN=MKMod,O=Mod,C=BR" -noprompt >/dev/null 2>&1
+        mkdir -p unsigned_apks signed_apks aligned_apks
+        python3 - <<'PYPACK'
+        from pathlib import Path
+        import os, shutil, zipfile
+        apks = sorted(Path('xapk_contents').rglob('*.apk'))
+        base = Path(os.environ['BASE_APK_PATH'])
+        native_apk = Path(os.environ['GAME_LIB_APK'])
+        abi = os.environ['TARGET_ABI']
+        if not apks: raise SystemExit('::error::Nenhum APK encontrado.')
+        # Quando a lib da engine reside em config.armeabi_v7a.apk, o mod nativo
+        # tambem precisa estar nesse mesmo conjunto de splits e ABI.
+        if not Path(f'mod_lib/lib/{abi}/libMKMod.so').is_file():
+            raise SystemExit(f'::error::libMKMod.so para {abi} ausente.')
+        for src in apks:
+            dst = Path('unsigned_apks') / src.name
+            if src == base:
+                shutil.copyfile('mk_modded.apk', dst)
+            else:
+                shutil.copyfile(src, dst)
+            if src == native_apk:
+                # Reconstruir ZIP para substituir entradas existentes de modo seguro.
+                tmp = dst.with_suffix('.tmp')
+                replacements = {
+                    f'lib/{abi}/libMKMod.so': Path(f'mod_lib/lib/{abi}/libMKMod.so'),
+                    f'lib/{abi}/libMenu.so': Path(f'app/src/main/cpp/Menu/libs/{abi}/libMenu.so'),
+                }
+                with zipfile.ZipFile(dst, 'r') as orig, zipfile.ZipFile(tmp, 'w') as out:
+                    for item in orig.infolist():
+                        if item.filename in replacements: continue
+                        out.writestr(item, orig.read(item.filename))
+                    for member, path in replacements.items():
+                        if not path.is_file(): raise SystemExit(f'::error::Falta {path}')
+                        out.write(path, arcname=member, compress_type=zipfile.ZIP_STORED)
+                os.replace(tmp, dst)
+            print('PREPARADO', dst, '(base)' if src == base else '(split)')
+        PYPACK
+        # PackageManager recusa APKs divididos assinados com certificados diferentes.
+        for apk in unsigned_apks/*.apk; do
+          name="$(basename "$apk")"
+          zipalign -p -f 4 "$apk" "aligned_apks/$name"
+          apksigner sign --ks mk.keystore --ks-pass pass:mkmodpass \
+            --key-pass pass:mkmodpass --ks-key-alias mk \
+            --out "signed_apks/$name" "aligned_apks/$name"
+          apksigner verify "signed_apks/$name"
+        done
+        COUNT="$(find signed_apks -maxdepth 1 -type f -name '*.apk' | wc -l)"
+        echo "APKs assinados: $COUNT"
+        if [ "$COUNT" -gt 1 ]; then
+          # Artefato .apks com as partes instalaveis via adb install-multiple.
+          (cd signed_apks && zip -q -0 ../mk_final.apks ./*.apk)
+          test -s mk_final.apks
+          echo '::notice::Gerado mk_final.apks (multiplos APKs; NAO instalar apenas o base).'
+        else
+          cp signed_apks/*.apk mk_final.apk
+          echo '::notice::Gerado mk_final.apk unico.'
+        fi
+        ls -lh mk_final.apk mk_final.apks 2>/dev/null || true
 
     # ── 19. Upload artifacts ──────────────────────────────────────────────────
-    - name: Upload modded APK
+    - name: Upload signed MK APK set
       uses: actions/upload-artifact@v4
       with:
-        name: MK-Mobile-7.4.0-MODDED
-        path: mk_final.apk
+        name: MK-Mobile-MODDED-signed-splits
+        path: |
+          mk_final.apk
+          mk_final.apks
+          signed_apks/*.apk
+        if-no-files-found: error
         retention-days: 7
 
-    - name: Upload libgame.so
+    - name: Upload game native library
       uses: actions/upload-artifact@v4
       with:
-        name: libgame-so-1449740
-        path: libgame.so
+        name: original-game-library
+        path: |
+          libgame.so
+          libUE4.so
+          libUnreal.so
+          libil2cpp.so
+          libunity.so
+          libmain.so
         if-no-files-found: ignore
         retention-days: 7
 
@@ -501,10 +578,13 @@ jobs:
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        if [ -f mk_final.apk ]; then
+        if [ -f mk_final.apks ]; then
+          APK_SIZE=$(du -h mk_final.apks | cut -f1)
+        elif [ -f mk_final.apk ]; then
           APK_SIZE=$(du -h mk_final.apk | cut -f1)
         else
           APK_SIZE="N/A"
         fi
         echo "APK: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
-
+        echo "Game: ${GAME_LIB_NAME:-unknown} / ABI: ${TARGET_ABI:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
