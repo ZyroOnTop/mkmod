@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       xapk_url:
-        description: 'URL direta do XAPK do MK Mobile 7.4.0'
+        description: 'URL direta do XAPK do MK Mobile 7.4.0 (APKMirror / APKPure download link)'
         required: true
         type: string
 
@@ -21,28 +21,35 @@ jobs:
       ABI:         'arm64-v8a'
 
     steps:
+    # ── 1. Checkout ──────────────────────────────────────────────────────────
     - name: Checkout repo
       uses: actions/checkout@v4
 
+    # ── 2. Setup Java ────────────────────────────────────────────────────────
     - name: Setup Java 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
 
+    # ── 3. Setup Android SDK + NDK ───────────────────────────────────────────
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
 
     - name: Install NDK + CMake + build-tools
       run: |
-        sdkmanager \
+        export ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
+        echo "Using ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+        yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install "cmdline-tools;latest"
+        yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses
+        yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" \
           "ndk;${{ env.NDK_VERSION }}" \
           "cmake;3.22.1" \
-          "build-tools;${{ env.BUILD_TOOLS }}" \
-          --no_https 2>&1 | tail -5
+          "build-tools;${{ env.BUILD_TOOLS }}"
         echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
         echo "$ANDROID_SDK_ROOT/build-tools/${{ env.BUILD_TOOLS }}" >> $GITHUB_PATH
 
+    # ── 4. Instalar dependências do sistema ───────────────────────────────────
     - name: Install system deps
       run: |
         sudo apt-get update -q
@@ -50,6 +57,7 @@ jobs:
           apktool zipalign python3 python3-pip git wget unzip \
           cmake ninja-build
 
+    # ── 5. Clonar dependências C++ ────────────────────────────────────────────
     - name: Clone C++ dependencies
       working-directory: app/src/main/cpp
       run: |
@@ -57,6 +65,7 @@ jobs:
         git clone --depth=1 https://github.com/jmpews/Dobby.git      Dobby
         git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
 
+    # ── 6. Compilar Dobby (ARM64) ─────────────────────────────────────────────
     - name: Build Dobby arm64-v8a
       run: |
         cd app/src/main/cpp/Dobby
@@ -69,49 +78,62 @@ jobs:
           -DAndroidNDK_ROOT=$ANDROID_NDK \
           -G Ninja
         ninja -j$(nproc)
+        # organiza no path esperado pelo CMakeLists
         mkdir -p ../libs/arm64-v8a
         cp libdobby.a ../libs/arm64-v8a/
+        echo "Dobby arm64 built: $(ls -lh ../libs/arm64-v8a/)"
 
+    # ── 7. Build LGL Menu (arm64) ─────────────────────────────────────────────
     - name: Build LGL Menu arm64-v8a
       run: |
         cd app/src/main/cpp/Menu
+        # O LGL tem seu próprio CMake
         mkdir -p build_arm64 && cd build_arm64
         cmake .. \
           -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
           -DANDROID_ABI=arm64-v8a \
           -DANDROID_NATIVE_API_LEVEL=${{ env.API_LEVEL }} \
           -DCMAKE_BUILD_TYPE=Release \
-          -G Ninja || true
+          -G Ninja || true   # alguns templates usam Makefile
         ninja -j$(nproc) 2>/dev/null || make -j$(nproc) 2>/dev/null || true
+        # organiza
         mkdir -p ../libs/arm64-v8a ../include
+        # tenta achar o .so gerado
         SO=$(find . -name 'libMenu.so' | head -1)
         if [ -n "$SO" ]; then
           cp "$SO" ../libs/arm64-v8a/libMenu.so
+          echo "Menu lib found: $SO"
         else
+          echo "libMenu.so not found — creating stub"
+          # stub mínimo para linkar (sem overlay real)
           cat > /tmp/menu_stub.cpp << 'STUB'
-        #include <android/log.h>
-        extern "C" {
-          void StartMenuThread(const char* t) { __android_log_print(2,"MKMenu","started: %s",t); }
-          bool GetToggleState(int id) { return false; }
-          float GetSliderValue(int id) { return 1.0f; }
-          void RegisterToggle(int id, const char* l, bool d) {}
-          void RegisterSlider(int id, const char* l, float mn, float mx, float d) {}
-        }
+          #include <android/log.h>
+          extern "C" {
+            void StartMenuThread(const char* t) { __android_log_print(2,"MKMenu","started: %s",t); }
+            bool GetToggleState(int id) { return false; }
+            float GetSliderValue(int id) { return 1.0f; }
+            void RegisterToggle(int id, const char* l, bool d) {}
+            void RegisterSlider(int id, const char* l, float mn, float mx, float d) {}
+          }
         STUB
           $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ \
             -shared -fPIC -o ../libs/arm64-v8a/libMenu.so /tmp/menu_stub.cpp \
             -llog
+          echo "Stub Menu lib created"
         fi
+        # cria include/Menu.h mínimo se não existir
         [ -f include/Menu.h ] || cat > include/Menu.h << 'INC'
-        extern "C" {
-          void StartMenuThread(const char* title);
-          bool GetToggleState(int id);
-          float GetSliderValue(int id);
-          void RegisterToggle(int id, const char* label, bool def);
-          void RegisterSlider(int id, const char* label, float min, float max, float def);
-        }
+          extern "C" {
+            void StartMenuThread(const char* title);
+            bool GetToggleState(int id);
+            float GetSliderValue(int id);
+            void RegisterToggle(int id, const char* label, bool def);
+            void RegisterSlider(int id, const char* label, float min, float max, float def);
+          }
         INC
+        ls -lh ../libs/arm64-v8a/
 
+    # ── 8. Compilar MKMod.so ──────────────────────────────────────────────────
     - name: Build MKMod arm64-v8a
       run: |
         mkdir -p build_mkmod && cd build_mkmod
@@ -124,9 +146,12 @@ jobs:
         ninja -j$(nproc)
         mkdir -p ../mod_lib/lib/arm64-v8a
         cp libMKMod.so ../mod_lib/lib/arm64-v8a/
+        echo "MKMod.so built: $(ls -lh ../mod_lib/lib/arm64-v8a/)"
 
+    # ── 9. Download XAPK ──────────────────────────────────────────────────────
     - name: Download MK Mobile XAPK
       run: |
+        echo "Downloading from: ${{ github.event.inputs.xapk_url }}"
         wget -q --show-progress \
           -O mk740.xapk \
           "${{ github.event.inputs.xapk_url }}" \
@@ -134,27 +159,43 @@ jobs:
           --timeout=300
         ls -lh mk740.xapk
 
+    # ── 10. Extrair APK e libgame.so do XAPK ─────────────────────────────────
     - name: Extract APK and libgame.so from XAPK
       run: |
         mkdir -p xapk_contents
+        # XAPK é um ZIP — extrai tudo
         unzip -q mk740.xapk -d xapk_contents/ || true
+        # Dentro pode ter um .apk principal
         BASE_APK=$(find xapk_contents -name '*.apk' | head -1)
         if [ -z "$BASE_APK" ]; then
+          # Às vezes o XAPK já é o APK renomeado
           cp mk740.xapk base.apk
         else
           cp "$BASE_APK" base.apk
         fi
-        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ || true
+        echo "Base APK: $(ls -lh base.apk)"
+
+        # Extrai libgame.so do APK
+        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ || \
+        unzip -q base.apk lib/arm64-v8a/libgame.so -d extracted/ 2>/dev/null || true
+        
         LIBGAME=$(find extracted -name 'libgame.so' | head -1)
         if [ -n "$LIBGAME" ]; then
           cp "$LIBGAME" libgame.so
+          echo "libgame.so extracted: $(ls -lh libgame.so)"
+        else
+          echo "WARNING: libgame.so not found in APK"
+          # list libs available
+          unzip -l base.apk | grep '\.so'
         fi
 
+    # ── 11. Scanner de offsets ────────────────────────────────────────────────
     - name: Scan offsets from libgame.so
       run: |
         if [ -f libgame.so ]; then
           python3 scripts/find_offsets.py libgame.so
         else
+          echo "libgame.so not available — writing zero offsets"
           cat > hack_offsets.env << 'EOF'
         OFFSET_TAKEDAMAGE=0x0
         OFFSET_GETHEALTH=0x0
@@ -164,48 +205,72 @@ jobs:
         fi
         cat hack_offsets.env
 
+    # ── 12. Inject offsets no hack.h ─────────────────────────────────────────
     - name: Inject offsets into hack.h
       run: |
         python3 scripts/inject_and_patch.py \
           hack_offsets.env \
           app/src/main/cpp/hack.h \
-          /dev/null
+          /dev/null   # smali ainda não existe — só inject no .h aqui
+        echo "hack.h after injection:"
+        grep -E 'Off::' app/src/main/cpp/hack.h || grep '0x' app/src/main/cpp/hack.h
 
+    # ── 13. Rebuild MKMod.so com offsets reais ────────────────────────────────
     - name: Rebuild MKMod with real offsets
       run: |
         cd build_mkmod
         ninja -j$(nproc)
         cp libMKMod.so ../mod_lib/lib/arm64-v8a/
+        ls -lh ../mod_lib/lib/arm64-v8a/
 
+    # ── 14. Descompilar APK com apktool ───────────────────────────────────────
     - name: Decompile base APK with apktool
       run: |
         apktool d base.apk -o mk_decompiled/ --no-res -q || \
         apktool d base.apk -o mk_decompiled/ -q
+        echo "Decompiled. Smali dirs:"
+        ls mk_decompiled/ | grep smali
 
+    # ── 15. Copiar .so + patch smali ─────────────────────────────────────────
     - name: Inject lib + patch smali
       run: |
+        # Copia libMKMod.so
         mkdir -p mk_decompiled/lib/arm64-v8a
         cp mod_lib/lib/arm64-v8a/libMKMod.so mk_decompiled/lib/arm64-v8a/
+        # Copia libMenu.so (overlay)
         cp app/src/main/cpp/Menu/libs/arm64-v8a/libMenu.so mk_decompiled/lib/arm64-v8a/
+        echo "Libs in APK:"
+        ls -lh mk_decompiled/lib/arm64-v8a/
+
+        # Patch smali
         python3 scripts/inject_and_patch.py \
           hack_offsets.env \
           app/src/main/cpp/hack.h \
           mk_decompiled/
 
+    # ── 16. Adicionar permissão SYSTEM_ALERT_WINDOW no manifest ───────────────
     - name: Patch AndroidManifest.xml
       run: |
         MANIFEST=mk_decompiled/AndroidManifest.xml
         if ! grep -q 'SYSTEM_ALERT_WINDOW' "$MANIFEST"; then
+          # Insere antes de <application
           sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
+          echo "SYSTEM_ALERT_WINDOW permission added"
+        else
+          echo "Permission already present"
         fi
 
+    # ── 17. Recompilar APK com apktool ────────────────────────────────────────
     - name: Recompile APK with apktool
       run: |
         apktool b mk_decompiled/ -o mk_modded.apk --use-aapt2 2>&1 | tail -10 || \
         apktool b mk_decompiled/ -o mk_modded.apk 2>&1 | tail -10
+        ls -lh mk_modded.apk
 
+    # ── 18. Gerar keystore + zipalign + assinar ────────────────────────────────
     - name: Sign APK
       run: |
+        # Gera keystore temporária
         keytool -genkey -v \
           -keystore mk.keystore \
           -alias mk \
@@ -215,7 +280,11 @@ jobs:
           -keypass mkmodpass \
           -dname "CN=MKMod, OU=Mod, O=Mod, L=City, S=State, C=BR" \
           -noprompt
+
+        # Zipalign
         zipalign -v 4 mk_modded.apk mk_aligned.apk
+
+        # Assinar
         apksigner sign \
           --ks mk.keystore \
           --ks-pass pass:mkmodpass \
@@ -223,8 +292,13 @@ jobs:
           --ks-key-alias mk \
           --out mk_final.apk \
           mk_aligned.apk
+
+        echo "Final APK: $(ls -lh mk_final.apk)"
+
+        # Verifica assinatura
         apksigner verify mk_final.apk && echo "Signature OK"
 
+    # ── 19. Upload artifacts ──────────────────────────────────────────────────
     - name: Upload modded APK
       uses: actions/upload-artifact@v4
       with:
@@ -232,7 +306,7 @@ jobs:
         path: mk_final.apk
         retention-days: 7
 
-    - name: Upload libgame.so
+    - name: Upload libgame.so (para análise manual no Ghidra)
       uses: actions/upload-artifact@v4
       with:
         name: libgame-so-1449740
@@ -245,3 +319,20 @@ jobs:
         name: offsets-report
         path: hack_offsets.env
         retention-days: 7
+
+    # ── 20. Sumário ───────────────────────────────────────────────────────────
+    - name: Build summary
+      run: |
+        echo "## MK Mod Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Version:** 7.4.0 (1449740)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Offsets found:**" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat hack_offsets.env >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**APK size:** $(du -h mk_final.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Download **MK-Mobile-7.4.0-MODDED** artifact above." >> $GITHUB_STEP_SUMMARY
+        echo "If any offset is 0x0, download **libgame-so-1449740** and derive in Ghidra." >> $GITHUB_STEP_SUMMARY
