@@ -788,8 +788,23 @@ jobs:
           name="$(basename "$apk")"
           zipalign -p -f 4 "$apk" "aligned_apks/$name"
           apksigner sign --ks mk.keystore --ks-pass pass:mkmodpass \
+            --key-pass pass:mkmodpass --ks-key-alias mk \
+            --out "signed_apks/$name" "aligned_apks/$name"
+          apksigner verify "signed_apks/$name"
+        done
+        COUNT="$(find signed_apks -maxdepth 1 -type f -name '*.apk' | wc -l)"
+        echo "APKs assinados: $COUNT"
+        if [ "$COUNT" -gt 1 ]; then
+          # Artefato .apks com as partes instalaveis via adb install-multiple.
+          (cd signed_apks && zip -q -0 ../mk_final.apks ./*.apk)
+          test -s mk_final.apks
+          echo '::notice::Gerado mk_final.apks (multiplos APKs; NAO instalar apenas o base).'
+        else
+          cp signed_apks/*.apk mk_final.apk
+          echo '::notice::Gerado mk_final.apk unico.'
+        fi
+        ls -lh mk_final.apk mk_final.apks 2>/dev/null || true
 
- 
     # ── 19. Upload artifacts ──────────────────────────────────────────────────
     - name: Upload signed MK APK set
       uses: actions/upload-artifact@v4
@@ -846,4 +861,3 @@ jobs:
           echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
         fi
         if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
-        
