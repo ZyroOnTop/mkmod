@@ -1,4 +1,4 @@
-name: MK Mod Build — XAPK ABI-aware UE4 v6
+name: MK Mod Build — XAPK UE4 Smali Fix v7
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - XAPK UE4 V6
+    - name: Confirmar versao do workflow - Smali Fix V7
       run: |
-        echo "::notice::XAPK UE4 V6 ATIVO"
+        echo "::notice::SMALI FIX V7 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -403,15 +403,52 @@ jobs:
         test -s hack_offsets.env || { echo "::error::Scanner nao gerou offsets para $GAME_LIB_NAME ($GAME_ENGINE)."; exit 1; }
         cat hack_offsets.env
 
-    # ── 12. Inject offsets no hack.h ─────────────────────────────────────────
-    - name: Inject offsets into hack.h
+    # ── 12. Atualizar somente hack.h (SEM smali nesta etapa) ────────────────
+    - name: Update hack.h offsets only [V7]
+      shell: bash
       run: |
         set -euo pipefail
-        python3 scripts/inject_and_patch.py \
-          hack_offsets.env \
-          app/src/main/cpp/hack.h \
-          /dev/null
+        # Atualiza SOMENTE o header. Nao roda o patch de smali antes do apktool.
+        python3 - <<'PYOFFSETS'
+        from pathlib import Path
+        import re
 
+        env = Path('hack_offsets.env')
+        header = Path('app/src/main/cpp/hack.h')
+        if not env.is_file() or not header.is_file():
+            raise SystemExit('::error::hack_offsets.env ou hack.h ausente')
+        values = {}
+        for raw in env.read_text().splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith('#'):
+                continue
+            m = re.fullmatch(r'(OFFSET_[A-Za-z0-9_]+)\s*=\s*(0[xX][0-9a-fA-F]+|\d+)', raw)
+            if not m:
+                raise SystemExit(f'::error::Formato de offset invalido: {raw}')
+            values[m[1]] = m[2]
+        if not values:
+            raise SystemExit('::error::Nenhum OFFSET_ encontrado em hack_offsets.env')
+
+        source = header.read_text()
+        for key, value in values.items():
+            # Atribuicao numerica (#define, constexpr, static uintptr_t, etc.)
+            pattern = rf'(?m)^(\s*(?:#\s*define\s+{re.escape(key)}\s+|[^\n;]*\b{re.escape(key)}\s*=\s*))(0[xX][0-9a-fA-F]+|\d+)(?=\s*(?:;|//|/\*|$))'
+            matches = list(re.finditer(pattern, source))
+            if len(matches) == 1:
+                source = source[:matches[0].start(2)] + value + source[matches[0].end(2):]
+                print(f'[offset] {key} = {value} (atualizado no hack.h)')
+            elif len(matches) > 1:
+                raise SystemExit(f'::error::Multiplas definicoes numericas de {key} em hack.h; revisar codigo')
+            elif re.search(rf'\b{re.escape(key)}\b', source):
+                raise SystemExit(f'::error::{key} existe em hack.h, mas com formato desconhecido; revisar codigo')
+            else:
+                # Preserva compatibilidade com headers que usam macros e ainda nao definem a chave.
+                source += f'\n#ifndef {key}\n#define {key} {value}\n#endif\n'
+                print(f'[offset] {key} = {value} (macro adicionada)')
+        header.write_text(source)
+        if all(int(value, 0) == 0 for value in values.values()):
+            print('::warning::Todos os offsets encontrados sao 0x0. A compilacao pode terminar, mas o scanner NAO descobriu offsets funcionais para UE4.')
+        PYOFFSETS
 
     # ── 13. Build MKMod.so (com offsets injetados) ──────────────────────────
     - name: Build MKMod for detected ABI [V6]
@@ -439,19 +476,135 @@ jobs:
         test -f mk_decompiled/AndroidManifest.xml
         find mk_decompiled -maxdepth 1 -name 'smali*' -print
 
-    # ── 15. Patch smali no APK base ──────────────────────────────────────────
-    - name: Patch base APK smali [V6]
+    # ── 15. Patch smali na entrada REAL indicada pelo AndroidManifest ───────
+    - name: Inject MKMod load into manifest entry class [V7]
       shell: bash
       run: |
         set -euo pipefail
-        # A biblioteca nativa vai para o split correto durante o empacotamento,
-        # nao para uma arquitetura arm64-v8a que este XAPK nao possui.
-        python3 scripts/inject_and_patch.py \
-          hack_offsets.env \
-          app/src/main/cpp/hack.h \
-          mk_decompiled/
+        # Escolher pelo AndroidManifest real: jogos UE4 nao precisam ter MainActivity.smali.
+        cat > /tmp/patch_mkmod_smali.py <<'PYSMALI'
+        from pathlib import Path
+        from xml.etree import ElementTree as ET
+        import re
 
-     # ── 16. Patch manifest ────────────────────────────────────────────────────
+        root = Path('mk_decompiled')
+        manifest = root / 'AndroidManifest.xml'
+        if not manifest.is_file():
+            raise SystemExit('::error::APK precisa ser descompilado ANTES de aplicar o patch Smali')
+
+        try:
+            tree = ET.parse(manifest)
+        except ET.ParseError as e:
+            raise SystemExit(f'::error::AndroidManifest.xml invalido: {e}')
+
+        m = tree.getroot()
+        android = '{http://schemas.android.com/apk/res/android}'
+        package = m.get('package', '')
+        app = m.find('application')
+        if app is None:
+            raise SystemExit('::error::Manifest sem tag application')
+
+        def fqcn(name):
+            if not name:
+                return ''
+            if name.startswith('.'):
+                return package + name
+            if '.' not in name:
+                return package + '.' + name
+            return name
+
+        launchers = []
+        for tag in ('activity', 'activity-alias'):
+            for entry in app.findall(tag):
+                for intent in entry.findall('intent-filter'):
+                    actions = {x.get(android+'name') for x in intent.findall('action')}
+                    categories = {x.get(android+'name') for x in intent.findall('category')}
+                    if ('android.intent.action.MAIN' in actions and
+                        'android.intent.category.LAUNCHER' in categories):
+                        clazz = entry.get(android+'targetActivity') if tag == 'activity-alias' else entry.get(android+'name')
+                        launchers.append(fqcn(clazz))
+
+        names = list(dict.fromkeys(x for x in launchers + [fqcn(app.get(android+'name'))] if x))
+        if not names:
+            raise SystemExit('::error::Manifest nao informa Activity de entrada nem Application propria')
+
+        smali_roots = [p for p in root.iterdir() if p.is_dir() and p.name.startswith('smali')]
+        if not smali_roots:
+            raise SystemExit('::error::APK descompilado sem codigo Smali; procure o split contendo classes.dex')
+
+        selected = None
+        for name in names:
+            relative = Path(*name.split('.')).with_suffix('.smali')
+            for folder in smali_roots:
+                found = folder / relative
+                if found.is_file():
+                    selected = (found, name, name in launchers)
+                    break
+            if selected:
+                break
+        if selected is None:
+            raise SystemExit('::error::Nenhuma classe de entrada do Manifest foi encontrada no Smali. Candidatas: '+', '.join(names))
+
+        path, name, is_activity = selected
+        source = path.read_text()
+        class_match = re.search(r'(?m)^\.class\s+.*?\s+(L[^;]+;)\s*$', source)
+        super_match = re.search(r'(?m)^\.super\s+(L[^;]+;)\s*$', source)
+        if not class_match or not super_match:
+            raise SystemExit('::error::Classe ou superclass Smali nao identificada em '+str(path))
+        class_desc, super_desc = class_match[1], super_match[1]
+        method_sig = 'onCreate(Landroid/os/Bundle;)V' if is_activity else 'onCreate()V'
+        helper = 'mkmod$load()V'
+        call = f'    invoke-static {{}}, {class_desc}->{helper}'
+
+        if helper in source or 'const-string v0, "MKMod"' in source:
+            if call in source:
+                print('[smali] patch ja aplicado em', path)
+                raise SystemExit(0)
+            raise SystemExit('::error::Loader MKMod ja existe, mas nao esta corretamente conectado ao onCreate')
+
+        # Usar helper sem argumentos evita mexer nos registradores do metodo original.
+        block = re.search(r'(?m)^\.method[^\n]*\b'+re.escape(method_sig)+r'\s*\n.*?^\.end method\s*$', source, re.S|re.M)
+        if block:
+            method = block.group(0)
+            regs = re.search(r'(?m)^\s*\.(?:locals|registers)\s+\d+\s*$', method)
+            if not regs:
+                raise SystemExit('::error::onCreate sem .locals ou .registers em '+str(path))
+            # Inserir depois do super.onCreate, quando presente, para preservar inicializacao.
+            supercall = re.search(r'(?m)^\s*invoke-super[^\n]*->onCreate\([^\n]*\)V\s*$', method)
+            position = supercall.end() if supercall else regs.end()
+            method = method[:position] + '\n' + call + method[position:]
+            source = source[:block.start()] + method + source[block.end():]
+        else:
+            # Classes que herdam onCreate nao possuem metodo proprio: criar override valido.
+            if is_activity:
+                body = ('.method public onCreate(Landroid/os/Bundle;)V\n'
+                        '    .locals 0\n'
+                        f'    invoke-super {{p0, p1}}, {super_desc}->onCreate(Landroid/os/Bundle;)V\n'
+                        f'{call}\n    return-void\n.end method\n')
+            else:
+                body = ('.method public onCreate()V\n'
+                        '    .locals 0\n'
+                        f'    invoke-super {{p0}}, {super_desc}->onCreate()V\n'
+                        f'{call}\n    return-void\n.end method\n')
+            source += '\n' + body
+
+        source += ('\n.method private static mkmod$load()V\n'
+                   '    .locals 1\n'
+                   '    const-string v0, "MKMod"\n'
+                   '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+                   '    return-void\n'
+                   '.end method\n')
+        path.write_text(source)
+        if call not in source or 'loadLibrary(Ljava/lang/String;)V' not in source:
+            raise SystemExit('::error::Validacao da injeção Smali falhou')
+        print(f'[smali] Entrada do Manifest: {name} ({"Activity" if is_activity else "Application"})')
+        print(f'[smali] Biblioteca: libMKMod.so / arquitetura definida pelo split nativo')
+        print(f'[smali] Patch aplicado em {path} (sem alterar registradores originais)')
+        PYSMALI
+        python3 /tmp/patch_mkmod_smali.py
+
+
+    # ── 16. Patch manifest ────────────────────────────────────────────────────
     - name: Patch AndroidManifest
       run: |
         set -euo pipefail
