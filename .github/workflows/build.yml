@@ -1,18 +1,21 @@
-name: MK Mod Build — 7.4.0 — Dobby Stable v4
+name: MK Mod Build — 7.4.0 — Dobby Stable + XAPK fallback v5
 
 on:
   workflow_dispatch:
     inputs:
       xapk_url:
         description: 'URL direta do XAPK do MK Mobile 7.4.0'
-        required: true
+        required: false
+        default: 'https://d.apkpure.com/b/XAPK/com.wb.goog.mkx?version=latest'
         type: string
 
 jobs:
   build:
     name: Build + Inject + Sign
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
+    permissions:
+      contents: read
 
     env:
       NDK_VERSION:  '26.3.11579264'
@@ -32,6 +35,140 @@ jobs:
         echo "::notice::DOBBY STABLE V4 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
+
+    # ── XAPK primeiro: falha de download não gasta tempo compilando Dobby ──────
+    - name: Setup Python 3.11 (XAPK downloader)
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Download MK Mobile XAPK (APKPure / Chrome TLS / Release) [V5]
+      shell: bash
+      env:
+        XAPK_URL: ${{ inputs.xapk_url }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        : "${XAPK_URL:?URL do XAPK vazia}"
+
+        # Não confundir página HTML de bloqueio com arquivo XAPK verdadeiro.
+        valid_xapk() {
+          python3 - "$1" <<'PYZIP'
+        import os, sys, zipfile
+        p = sys.argv[1]
+        if not os.path.isfile(p) or os.path.getsize(p) < 1024 or not zipfile.is_zipfile(p):
+            sys.exit(1)
+        try:
+            with zipfile.ZipFile(p) as z:
+                files = z.namelist()
+                if not any(name.lower().endswith('.apk') for name in files):
+                    sys.exit(1)
+                print(f'XAPK valido: {os.path.getsize(p):,} bytes; APKs internos: {sum(x.lower().endswith(".apk") for x in files)}')
+        except (OSError, zipfile.BadZipFile):
+            sys.exit(1)
+        PYZIP
+        }
+
+        MIRROR_URL=""
+        case "$XAPK_URL" in
+          https://d.apkpure.com/*) MIRROR_URL="https://d.apkpure.net/${XAPK_URL#https://d.apkpure.com/}" ;;
+        esac
+
+        # Tentativa 1 e 2: o próprio endereço e o endpoint alternativo do APKPure.
+        try_curl() {
+          local url="$1"
+          rm -f mk740.xapk
+          echo "Tentativa HTTP: $url"
+          if curl -fLsS --retry 2 --retry-delay 3 --connect-timeout 30 --max-time 1800 \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
+              -H 'Referer: https://apkpure.com/' \
+              -H 'Accept: */*' \
+              --output mk740.xapk "$url"; then
+            if valid_xapk mk740.xapk; then return 0; fi
+            echo 'Resposta recebida, mas nao e um XAPK valido.'
+          else
+            echo "curl recusado. Tentando proximo metodo."
+          fi
+          rm -f mk740.xapk
+          return 1
+        }
+
+        DOWNLOADED=false
+        if try_curl "$XAPK_URL"; then
+          DOWNLOADED=true
+        elif [ -n "$MIRROR_URL" ] && try_curl "$MIRROR_URL"; then
+          DOWNLOADED=true
+        fi
+
+        # Tentativa 3: conexão TLS/HTTP2 com impressão digital realista de navegador.
+        # A origem original da URL é preservada; não é necessário substituir o link.
+        if [ "$DOWNLOADED" = false ]; then
+          echo 'Tentando conexao com TLS de Chrome (curl_cffi)...'
+          if python3 -m pip install --quiet --disable-pip-version-check curl_cffi; then
+            echo 'curl_cffi instalado.'
+          else
+            echo 'Falha ao instalar curl_cffi; seguindo para o proximo fallback.'
+          fi
+          if python3 -c 'import curl_cffi' >/dev/null 2>&1 && python3 - <<'PYBROWSER'
+        import os, sys, zipfile
+        from curl_cffi import requests
+
+        original = os.environ['XAPK_URL']
+        urls = [original]
+        if original.startswith('https://d.apkpure.com/'):
+            urls.append(original.replace('https://d.apkpure.com/', 'https://d.apkpure.net/', 1))
+
+        headers = {'Referer': 'https://apkpure.com/', 'Accept': '*/*'}
+        for url in urls:
+            try:
+                print(f'Chrome TLS: {url}', flush=True)
+                with requests.Session(impersonate='chrome', headers=headers) as s:
+                    with s.stream('GET', url, timeout=(30, 1800), allow_redirects=True) as r:
+                        print(f'HTTP: {r.status_code}', flush=True)
+                        r.raise_for_status()
+                        with open('mk740.xapk', 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=1024*1024):
+                                if chunk:
+                                    f.write(chunk)
+                with zipfile.ZipFile('mk740.xapk') as z:
+                    if not any(n.lower().endswith('.apk') for n in z.namelist()):
+                        raise ValueError('Arquivo nao contem nenhum APK')
+                print('Download XAPK via Chrome TLS OK!', flush=True)
+                sys.exit(0)
+            except Exception as exc:
+                print(f'Tentativa rejeitada: {type(exc).__name__}: {exc}', flush=True)
+                try: os.remove('mk740.xapk')
+                except FileNotFoundError: pass
+        sys.exit(1)
+        PYBROWSER
+          then
+            if valid_xapk mk740.xapk; then DOWNLOADED=true; fi
+          fi
+        fi
+
+        # Fallback seguro: caso o APKPure bloqueie o IP do GitHub, pegar a cópia
+        # que o próprio usuário baixou no navegador e anexou a um Release privado.
+        if [ "$DOWNLOADED" = false ]; then
+          echo 'APKPure bloqueou o runner. Verificando Release xapk-input...'
+          if gh release view xapk-input --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            rm -f mk740.xapk
+            if gh release download xapk-input --repo "$GITHUB_REPOSITORY" \
+                --pattern 'mk740.xapk' --dir . --clobber; then
+              if valid_xapk mk740.xapk; then DOWNLOADED=true; fi
+            else
+              echo 'Release encontrado, mas sem asset mk740.xapk acessivel.'
+            fi
+          fi
+        fi
+
+        if [ "$DOWNLOADED" = false ]; then
+          echo '::error::APKPure negou download (HTTP 403) inclusive por outros metodos.'
+          echo '::error::Abra a URL no seu navegador, baixe o XAPK e anexe-o como mk740.xapk ao GitHub Release com tag xapk-input do seu repo privado. Execute novamente.'
+          exit 1
+        fi
+
+        unzip -tq mk740.xapk | tail -2
+        ls -lh mk740.xapk
 
     # ── 2. Java 17 ───────────────────────────────────────────────────────────
     - name: Setup Java 17
@@ -183,20 +320,6 @@ jobs:
         }
         INC
         ls -lh ../libs/arm64-v8a/
-
-    # ── 9. Download XAPK ──────────────────────────────────────────────────────
-    - name: Download MK Mobile XAPK
-      shell: bash
-      env:
-        XAPK_URL: ${{ inputs.xapk_url }}
-      run: |
-        set -euo pipefail
-        test -n "$XAPK_URL" || { echo 'URL do XAPK vazia'; exit 1; }
-        curl --fail --location --retry 3 --connect-timeout 30 --max-time 1200 \
-          --user-agent 'Mozilla/5.0' --output mk740.xapk "$XAPK_URL"
-        test -s mk740.xapk
-        unzip -tq mk740.xapk | tail -2
-        ls -lh mk740.xapk
 
     # ── 10. Extrair APK e libgame.so ──────────────────────────────────────────
     - name: Extract APK and libgame.so
