@@ -1,0 +1,13 @@
+.gradle/
+.idea/
+build/
+local.properties
+*.keystore
+*.apk
+*.xapk
+*.so
+libgame.so
+hack_offsets.env
+app/src/main/cpp/KittyMemory/
+app/src/main/cpp/Dobby/
+app/src/main/cpp/Menu/
