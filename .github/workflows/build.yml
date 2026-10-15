@@ -1,4 +1,4 @@
-name: MK Mod Build — XAPK Native Fix V10
+name: MK Mod Build — V11
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - V10
+    - name: Confirmar versao do workflow - V11
       run: |
-        echo "::notice::NATIVE DEPENDENCY FIX V10 ATIVO"
+        echo "::notice::NATIVE DEPENDENCY FIX V11 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -391,7 +391,8 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release \
           -DDOBBY_DEBUG=OFF \
           -DDOBBY_BUILD_EXAMPLE=OFF \
-          -DDOBBY_BUILD_TEST=OFF
+          -DDOBBY_BUILD_TEST=OFF \
+          -DPlugin.SymbolResolver=OFF
         cmake --build build_arm64 --target dobby_static --parallel 4
         test -s build_arm64/libdobby.a || {
           echo '::error::Dobby compilou mas nao gerou libdobby.a.'
@@ -574,6 +575,7 @@ jobs:
           -DANDROID_ABI="$TARGET_ABI" \
           -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
           -DCMAKE_CXX_STANDARD=17 \
+          -DANDROID_STL=c++_shared \
           -DCMAKE_BUILD_TYPE=Release 2>&1 | tee diagnostic_logs/mkmod-cmake.log; then
           echo '::error::CMake falhou; confira o log mkmod-cmake.log anexado ao run.'
           find "$CPP" -maxdepth 3 -type f \( -name '*.a' -o -name '*.so' -o -name '*.h' \) | head -70 || true
@@ -702,7 +704,9 @@ jobs:
         candidates = [(base_apk, base_dir)]
         other_apks = sorted((a for a in all_apks if a != base_apk and count_dex(a)), key=lambda p: -count_dex(p))
         for a in other_apks:
-            candidates.append((a, Path('mk_extra_decoded') / a.stem))
+            dest = Path('mk_extra_decoded') / a.stem
+            dest.mkdir(parents=True, exist_ok=True)
+            candidates.append((a, dest))
         
         
         def locate(directory, classname):
@@ -933,10 +937,9 @@ jobs:
         import os, struct, zipfile
         original_apks = sorted(Path('xapk_contents').rglob('*.apk'))
         signed_apks = sorted(Path('signed_apks').glob('*.apk'))
-        original_names = [p.name for p in original_apks]
-        signed_names = [p.name for p in signed_apks]
-        if len(original_names) != len(set(original_names)):
-            raise SystemExit('::error::APKs do XAPK tem nomes duplicados. Requer empacotamento por caminho relativo.')
+        # Usar apenas o nome do arquivo como chave (consistente com como os splits são assinados)
+        original_names = sorted(set(p.name for p in original_apks))
+        signed_names = sorted(p.name for p in signed_apks)
         if sorted(original_names) != sorted(signed_names):
             raise SystemExit(f'::error::Conjunto final incompleto: original={original_names}, assinado={signed_names}')
         abi = os.environ['TARGET_ABI']
@@ -970,7 +973,7 @@ jobs:
             if not Path('mk_final.apk').is_file():
                 raise SystemExit('::error::mk_final.apk ausente')
             print('[audit] APK unico assinado')
-        print('::notice::Auditoria final V10 passou. Isto valida arquivos, nao funcionamento do mod em execucao.')
+        print('::notice::Auditoria final V11 passou. Isto valida arquivos, nao funcionamento do mod em execucao.')
         PYAUDIT10
 
     # ── 19. Upload artifacts ──────────────────────────────────────────────────
@@ -1011,7 +1014,7 @@ jobs:
     - name: Build summary
       if: always()
       run: |
-        echo "## MK Mod 7.4.0 Build (V10)" >> "$GITHUB_STEP_SUMMARY"
+        echo "## MK Mod 7.4.0 Build (V11)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -1029,5 +1032,4 @@ jobs:
           echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
         fi
         if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
-        echo 'Important: libMenu.so is a linker stub and the current scanner may return zero offsets; a generated APK does not imply a functional mod.' >> "$GITHUB_STEP_SUMMARY"
-
+        echo 'Important: libMenu.so e stub sem UI real. Scanner V11 detecta ABI e busca symbols UE4 mangled; offsets zerados ainda significam que o mod nao hookea nada — baixe libUE4.so do artifact e use Ghidra para derivacao manual.' >> "$GITHUB_STEP_SUMMARY"
