@@ -298,7 +298,7 @@ EOF
         retention-days: 7
 
     - name: Build summary
-  run: |
+      run: |
     echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
     echo '```' >> "$GITHUB_STEP_SUMMARY"
     [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
