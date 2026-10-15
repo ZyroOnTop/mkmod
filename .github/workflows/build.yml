@@ -298,9 +298,14 @@ EOF
         retention-days: 7
 
     - name: Build summary
-      run: |
-        echo "## MK Mod 7.4.0 Build" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        cat hack_offsets.env >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        echo "APK: $(du -h mk_final.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY
+  run: |
+    echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
+    echo '```' >> "$GITHUB_STEP_SUMMARY"
+    [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
+    echo '```' >> "$GITHUB_STEP_SUMMARY"
+    if [ -f mk_final.apk ]; then
+      APK_SIZE=$(du -h mk_final.apk | cut -f1)
+    else
+      APK_SIZE="N/A"
+    fi
+    echo "APK: $APK_SIZE" >> "$GITHUB_STEP_SUMMARY"
