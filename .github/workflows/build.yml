@@ -1,4 +1,4 @@
-name: MK Mod Build — XAPK KittyMemory Fix v9
+name: MK Mod Build — XAPK Native Fix V10
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - KittyMemory V9
+    - name: Confirmar versao do workflow - V10
       run: |
-        echo "::notice::KITTYMEMORY FIX V9 ATIVO"
+        echo "::notice::NATIVE DEPENDENCY FIX V10 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -330,7 +330,44 @@ jobs:
         test -f Dobby/CMakeLists.txt
         test -f Dobby/include/dobby.h
         test -f Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.cc
+        # IMPORTANTE: CMakeLists.txt do MKMod usa "dobby" (minusculo),
+        # enquanto este workflow faz o checkout em "Dobby" (maiusculo).
+        # Linux diferencia os dois nomes; um symlink preserva ambos sem copiar fontes.
+        if [ -L dobby ]; then
+          test "$(realpath dobby)" = "$(realpath Dobby)" || {
+            echo '::error::cpp/dobby aponta para uma copia incorreta do Dobby.'
+            exit 1
+          }
+        elif [ -e dobby ]; then
+          echo '::error::cpp/dobby ja existe e nao e o alias do Dobby compilado.'
+          exit 1
+        else
+          ln -s Dobby dobby
+        fi
+        test -f dobby/include/dobby.h
+        echo '::notice::Alias de compatibilidade criado: cpp/dobby -> cpp/Dobby'
         git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
+
+    # ── Preflight: validar estrutura antes dos builds demorados ───────────────
+    - name: Preflight native paths (Dobby KittyMemory Menu) [V10]
+      shell: bash
+      run: |
+        set -euo pipefail
+        ROOT=app/src/main/cpp
+        echo 'Verificando nomes usados pelo CMake na maquina Linux...'
+        test -f "$ROOT/CMakeLists.txt"
+        test -f "$ROOT/KittyMemory/KittyMemory.cpp"
+        test -f "$ROOT/KittyMemory/KittyUtils.cpp"
+        test -f "$ROOT/KittyMemory/MemoryPatch.cpp"
+        test -f "$ROOT/Dobby/include/dobby.h"
+        test -f "$ROOT/dobby/include/dobby.h"
+        test "$(realpath "$ROOT/dobby")" = "$(realpath "$ROOT/Dobby")"
+        test -f "$ROOT/Menu/CMakeLists.txt" || echo '::notice::LGL nao inclui CMakeLists no diretorio esperado; o projeto utiliza um stub de menu.'
+        echo 'Referencias do CMake a Dobby/KittyMemory/Menu:'
+        grep -nEi 'dobby|kittymemory|menu|imported|include_directories' "$ROOT/CMakeLists.txt" || true
+        echo 'Alias Dobby:'
+        ls -ld "$ROOT/Dobby" "$ROOT/dobby"
+        echo '::notice::Preflight V10 passou (fontes e includes presentes).'
 
     # ── 6. Dobby ARM64: fonte historica estavel, sem patch ELF ─────────────
     - name: Build Dobby for detected game ABI [V6]
@@ -368,8 +405,12 @@ jobs:
         }
         mkdir -p "libs/$TARGET_ABI"
         cp build_arm64/libdobby.a "libs/$TARGET_ABI/libdobby.a"
-        echo '::notice::Dobby compilado para ABI detectada!'
-        ls -lh "libs/$TARGET_ABI/libdobby.a"
+        # O target importado pelo CMake pode referenciar cpp/dobby, caminho
+        # com letras minusculas; o alias simbolico aponta para esta mesma lib.
+        test -s "../dobby/libs/$TARGET_ABI/libdobby.a"
+        test -f "../dobby/include/dobby.h"
+        echo '::notice::Dobby compilado e acessivel pelos dois nomes de diretorio.'
+        ls -lh "libs/$TARGET_ABI/libdobby.a" "../dobby/libs/$TARGET_ABI/libdobby.a"
 
     # ── 7. Menu ───────────────────────────────────────────────────────────────
     - name: Build Menu link stub for detected ABI [V6]
@@ -499,28 +540,80 @@ jobs:
         PYOFFSETS8
 
     # ── 13. Build MKMod.so (com offsets injetados) ──────────────────────────
-    - name: Build MKMod for detected ABI [V6]
+    - name: Build MKMod for detected ABI + dependency diagnostics [V10]
       shell: bash
       run: |
         set -euo pipefail
-        # Diagnostico rapido para evitar o erro "Cannot find source file".
-        for source in KittyMemory.cpp KittyUtils.cpp MemoryPatch.cpp; do
-          test -s "app/src/main/cpp/KittyMemory/$source" || {
-            echo "::error::KittyMemory/$source nao existe no caminho esperado pelo CMake."
+        CPP=app/src/main/cpp
+        mkdir -p diagnostic_logs
+        echo '=== Inspecao dos prerequisitos do linker ==='
+        for src in KittyMemory.cpp KittyUtils.cpp MemoryPatch.cpp; do
+          test -s "$CPP/KittyMemory/$src" || {
+            echo "::error::KittyMemory/$src nao encontrado."
             exit 1
           }
         done
+        test -f "$CPP/dobby/include/dobby.h" || {
+          echo '::error::Include do Dobby nao existe em cpp/dobby/include.'
+          ls -ld "$CPP"/Dobby "$CPP"/dobby || true
+          exit 1
+        }
+        test -s "$CPP/dobby/libs/$TARGET_ABI/libdobby.a" || {
+          echo "::error::libdobby.a ausente no caminho usado pelo CMake: cpp/dobby/libs/$TARGET_ABI"
+          exit 1
+        }
+        test -s "$CPP/Menu/libs/$TARGET_ABI/libMenu.so" || {
+          echo '::error::Biblioteca Menu ausente na ABI selecionada.'
+          exit 1
+        }
+        # Nao reutilizar cache CMake de outra ABI.
         rm -rf build_mkmod
-        cmake -S app/src/main/cpp -B build_mkmod -G Ninja \
+        echo '=== Configurando CMake ==='
+        if ! cmake -S "$CPP" -B build_mkmod -G Ninja \
           -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
           -DANDROID_ABI="$TARGET_ABI" \
           -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
-          -DCMAKE_BUILD_TYPE=Release
-        cmake --build build_mkmod --parallel 4
-        test -s build_mkmod/libMKMod.so
+          -DCMAKE_CXX_STANDARD=17 \
+          -DCMAKE_BUILD_TYPE=Release 2>&1 | tee diagnostic_logs/mkmod-cmake.log; then
+          echo '::error::CMake falhou; confira o log mkmod-cmake.log anexado ao run.'
+          find "$CPP" -maxdepth 3 -type f \( -name '*.a' -o -name '*.so' -o -name '*.h' \) | head -70 || true
+          exit 1
+        fi
+        echo '=== Compilando MKMod ==='
+        if ! cmake --build build_mkmod --parallel 4 --verbose 2>&1 | tee diagnostic_logs/mkmod-build.log; then
+          echo '::error::Falha de compilacao C++/linkagem. Log completo anexado como artifact.'
+          exit 1
+        fi
+        test -s build_mkmod/libMKMod.so || {
+          echo '::error::Build nao gerou libMKMod.so'
+          find build_mkmod -name 'lib*.so' -type f -print
+          exit 1
+        }
+        NDK_READELF="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+        "$NDK_READELF" -h build_mkmod/libMKMod.so | tee diagnostic_logs/mkmod-elf-header.log
+        if [ "$TARGET_ABI" = 'armeabi-v7a' ]; then
+          "$NDK_READELF" -h build_mkmod/libMKMod.so | grep -Eq 'Class:[[:space:]]+ELF32' || {
+            echo '::error::Mod compilado em ABI diferente do XAPK (esperado ELF32).'
+            exit 1
+          }
+        elif [ "$TARGET_ABI" = 'arm64-v8a' ]; then
+          "$NDK_READELF" -h build_mkmod/libMKMod.so | grep -Eq 'Class:[[:space:]]+ELF64' || {
+            echo '::error::Mod compilado em ABI diferente do XAPK (esperado ELF64).'
+            exit 1
+          }
+        fi
         mkdir -p "mod_lib/lib/$TARGET_ABI"
-        cp build_mkmod/libMKMod.so "mod_lib/lib/$TARGET_ABI/"
+        cp build_mkmod/libMKMod.so "mod_lib/lib/$TARGET_ABI/libMKMod.so"
         ls -lh "mod_lib/lib/$TARGET_ABI/libMKMod.so"
+
+    - name: Upload native build diagnostic logs [V10]
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mkmod-native-diagnostics
+        path: diagnostic_logs/
+        if-no-files-found: ignore
+        retention-days: 7
 
 
     # ── 14. Descompilar APK ───────────────────────────────────────────────────
@@ -830,6 +923,56 @@ jobs:
         fi
         ls -lh mk_final.apk mk_final.apks 2>/dev/null || true
 
+    # ── Auditoria final dos arquivos realmente gerados ──────────────────────
+    - name: Audit signed APK splits and mod library [V10]
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PYAUDIT10'
+        from pathlib import Path
+        import os, struct, zipfile
+        original_apks = sorted(Path('xapk_contents').rglob('*.apk'))
+        signed_apks = sorted(Path('signed_apks').glob('*.apk'))
+        original_names = [p.name for p in original_apks]
+        signed_names = [p.name for p in signed_apks]
+        if len(original_names) != len(set(original_names)):
+            raise SystemExit('::error::APKs do XAPK tem nomes duplicados. Requer empacotamento por caminho relativo.')
+        if sorted(original_names) != sorted(signed_names):
+            raise SystemExit(f'::error::Conjunto final incompleto: original={original_names}, assinado={signed_names}')
+        abi = os.environ['TARGET_ABI']
+        native = Path('signed_apks') / Path(os.environ['GAME_LIB_APK']).name
+        if not native.is_file():
+            raise SystemExit('::error::Split da biblioteca do jogo nao foi assinado')
+        expected_class, expected_machine = ((1, 40) if abi == 'armeabi-v7a' else (2, 183))
+        with zipfile.ZipFile(native) as archive:
+            for name in (f'lib/{abi}/libMKMod.so', f'lib/{abi}/libMenu.so'):
+                try:
+                    with archive.open(name) as file:
+                        header = file.read(20)
+                except KeyError:
+                    raise SystemExit(f'::error::Biblioteca ausente do split final: {name}')
+                if len(header) < 20 or header[:4] != b'\x7fELF':
+                    raise SystemExit(f'::error::Nao e biblioteca ELF: {name}')
+                elf_class, machine = header[4], struct.unpack_from('<H', header, 18)[0]
+                if elf_class != expected_class or machine != expected_machine:
+                    raise SystemExit(f'::error::{name}: ABI incorreta (classe={elf_class}, maquina={machine})')
+                print(f'[audit] {name}: ELF verificado / ABI={abi}')
+        if len(signed_apks) > 1:
+            bundle = Path('mk_final.apks')
+            if not bundle.is_file():
+                raise SystemExit('::error::mk_final.apks nao foi criado')
+            with zipfile.ZipFile(bundle) as archive:
+                archived = sorted(n.removeprefix('./') for n in archive.namelist() if n.endswith('.apk'))
+                if archived != sorted(signed_names):
+                    raise SystemExit(f'::error::Pacote .apks esta incompleto: {archived}')
+            print(f'[audit] {len(signed_apks)} splits assinados e empacotados')
+        else:
+            if not Path('mk_final.apk').is_file():
+                raise SystemExit('::error::mk_final.apk ausente')
+            print('[audit] APK unico assinado')
+        print('::notice::Auditoria final V10 passou. Isto valida arquivos, nao funcionamento do mod em execucao.')
+        PYAUDIT10
+
     # ── 19. Upload artifacts ──────────────────────────────────────────────────
     - name: Upload signed MK APK set
       uses: actions/upload-artifact@v4
@@ -868,7 +1011,7 @@ jobs:
     - name: Build summary
       if: always()
       run: |
-        echo "## MK Mod 7.4.0 Build" >> "$GITHUB_STEP_SUMMARY"
+        echo "## MK Mod 7.4.0 Build (V10)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -886,4 +1029,5 @@ jobs:
           echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
         fi
         if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
+        echo 'Important: libMenu.so is a linker stub and the current scanner may return zero offsets; a generated APK does not imply a functional mod.' >> "$GITHUB_STEP_SUMMARY"
 
