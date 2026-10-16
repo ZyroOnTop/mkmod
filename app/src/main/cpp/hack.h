@@ -1,6 +1,6 @@
 // lang: C++, file: hack.h
-// target: com.wb.goog.mkx v7.4.0 (versionCode 1449740), libgame.so ARM64
-// Offsets [RE] = injetados pelo script find_offsets.py no CI antes do build.
+// target: com.wb.goog.mkx v7.4.0 (1449740), libUE4.so armeabi-v7a
+// Offsets injetados pelo CI via #define — compatíveis com PYOFFSETS8.
 
 #pragma once
 #include <cstdint>
@@ -15,14 +15,18 @@ inline bool  g_def_multi    = false;
 inline float g_dmg_value    = 5.0f;
 inline float g_def_value    = 5.0f;
 
-// ─── OFFSETS libgame.so 1449740 ARM64 ────────────────────────────────────────
-// Valores substituídos pelo CI via sed antes de compilar.
-// Se ficarem 0x0: CI não achou o pattern — baixe o libgame.so do artifact
-// e derive manualmente no Ghidra (ver README).
+// ─── OFFSETS libUE4.so armeabi-v7a ───────────────────────────────────────────
+// CI substitui os valores 0x0 abaixo via regex em #define.
+// Formato #define é o único que PYOFFSETS8 consegue patch de forma não-ambígua.
+
+#define OFFSET_TAKEDAMAGE  0x0
+#define OFFSET_GETHEALTH   0x0
+#define OFFSET_GETCOOLDOWN 0x0
+#define OFFSET_AITICK      0x0
 
 namespace Off {
-    constexpr uintptr_t TakeDamage      = OFFSET_TAKEDAMAGE;
-    constexpr uintptr_t GetHealth       = OFFSET_GETHEALTH;
-    constexpr uintptr_t GetCooldown     = OFFSET_GETCOOLDOWN;
-    constexpr uintptr_t AITick          = OFFSET_AITICK;
+    constexpr uintptr_t TakeDamage  = OFFSET_TAKEDAMAGE;
+    constexpr uintptr_t GetHealth   = OFFSET_GETHEALTH;
+    constexpr uintptr_t GetCooldown = OFFSET_GETCOOLDOWN;
+    constexpr uintptr_t AITick      = OFFSET_AITICK;
 }
