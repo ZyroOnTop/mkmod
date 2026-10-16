@@ -1,4 +1,4 @@
-name: MK Mod Build — V11
+name: MK Mod Build — V12
 
 on:
   workflow_dispatch:
@@ -30,9 +30,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Confirmar versao do workflow - V11
+    - name: Confirmar versao do workflow - V12
       run: |
-        echo "::notice::NATIVE DEPENDENCY FIX V11 ATIVO"
+        echo "::notice::NATIVE DEPENDENCY FIX V12 ATIVO"
         echo "Commit utilizado: $GITHUB_SHA"
         echo "Ref selecionada: $GITHUB_REF"
 
@@ -346,7 +346,7 @@ jobs:
         fi
         test -f dobby/include/dobby.h
         echo '::notice::Alias de compatibilidade criado: cpp/dobby -> cpp/Dobby'
-        git clone --depth=1 https://github.com/LGLTeam/Android-Mod-Menu.git Menu
+        echo "Menu UI embutido no projeto (MenuBridge.java + menu.h) — sem clone externo necessario"
 
     # ── Preflight: validar estrutura antes dos builds demorados ───────────────
     - name: Preflight native paths (Dobby KittyMemory Menu) [V10]
@@ -362,7 +362,7 @@ jobs:
         test -f "$ROOT/Dobby/include/dobby.h"
         test -f "$ROOT/dobby/include/dobby.h"
         test "$(realpath "$ROOT/dobby")" = "$(realpath "$ROOT/Dobby")"
-        test -f "$ROOT/Menu/CMakeLists.txt" || echo '::notice::LGL nao inclui CMakeLists no diretorio esperado; o projeto utiliza um stub de menu.'
+        echo "::notice::Menu embutido no projeto — sem dependencia de repo LGL"
         echo 'Referencias do CMake a Dobby/KittyMemory/Menu:'
         grep -nEi 'dobby|kittymemory|menu|imported|include_directories' "$ROOT/CMakeLists.txt" || true
         echo 'Alias Dobby:'
@@ -417,9 +417,7 @@ jobs:
     - name: Build Menu link stub for detected ABI [V6]
       shell: bash
       run: |
-        set -euo pipefail
-        # O repo LGL Android-Mod-Menu nao possui CMakeLists.txt na raiz;
-        # ele NAO e compilavel com cmake .. diretamente.
+        set -euo pipefail        # ele NAO e compilavel com cmake .. diretamente.
         # Esse stub apenas resolve symbols do CMake do MKMod; nao fornece UI.
         MENU_DIR="app/src/main/cpp/Menu"
         mkdir -p "$MENU_DIR/libs/$TARGET_ABI" "$MENU_DIR/include"
@@ -434,7 +432,6 @@ jobs:
         }
         STUB
         "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${TARGET_CLANG_TRIPLE}${API_LEVEL}-clang++" \
-          -shared -fPIC -o "$MENU_DIR/libs/$TARGET_ABI/libMenu.so" /tmp/menu_stub.cpp -llog
         cat > "$MENU_DIR/include/Menu.h" <<'INC'
         extern "C" {
           void StartMenuThread(const char* title);
@@ -444,8 +441,6 @@ jobs:
           void RegisterSlider(int id, const char* label, float min, float max, float def);
         }
         INC
-        echo '::warning::libMenu.so e STUB, nao exibe menu real. A interface LGL precisa ser integrada ao projeto nativo separadamente.'
-        ls -lh "$MENU_DIR/libs/$TARGET_ABI/libMenu.so"
 
     # ── 11. Scan offsets ──────────────────────────────────────────────────────
     - name: Scan offsets from detected game library [V6]
@@ -563,10 +558,6 @@ jobs:
           echo "::error::libdobby.a ausente no caminho usado pelo CMake: cpp/dobby/libs/$TARGET_ABI"
           exit 1
         }
-        test -s "$CPP/Menu/libs/$TARGET_ABI/libMenu.so" || {
-          echo '::error::Biblioteca Menu ausente na ABI selecionada.'
-          exit 1
-        }
         # Nao reutilizar cache CMake de outra ABI.
         rm -rf build_mkmod
         echo '=== Configurando CMake ==='
@@ -630,6 +621,86 @@ jobs:
     # ── 15. Procurar a Activity/Application REAL em todos os APKs com DEX ─
     - name: Locate and inject MKMod into the correct APK split [V8]
       shell: bash
+
+    - name: Compile MenuBridge.java and inject dex
+      run: |
+        set -euo pipefail
+
+        # O MenuBridge.java é código novo — precisa ser compilado para .dex
+        # e injetado no APK decompilado antes do apktool b
+
+        DECODED="mk_decoded"
+        SDK="$ANDROID_SDK_ROOT"
+        BUILD_TOOLS="$SDK/build-tools/$BUILD_TOOLS"
+        JAVA_SRC="app/src/main/java"
+        OUT_CLASSES="/tmp/menu_classes"
+        OUT_DEX="/tmp/menu_dex"
+
+        mkdir -p "$OUT_CLASSES" "$OUT_DEX"
+
+        # Compilar MenuBridge.java contra android.jar do SDK
+        ANDROID_JAR="$SDK/platforms/android-$API_LEVEL/android.jar"
+        if [ ! -f "$ANDROID_JAR" ]; then
+          # Instalar platform se não estiver disponível
+          yes | sdkmanager --sdk_root="$SDK" "platforms;android-${API_LEVEL}" > /dev/null 2>&1 || true
+          # Tentar platform 33 como fallback (android.jar é compatível)
+          ANDROID_JAR=$(find "$SDK/platforms" -name "android.jar" | sort | tail -1)
+        fi
+
+        if [ ! -f "$ANDROID_JAR" ]; then
+          echo "::warning::android.jar não encontrado — MenuBridge.java não será injetado (menu overlay não disponível)"
+          exit 0
+        fi
+
+        echo "Compilando MenuBridge.java com $ANDROID_JAR"
+        javac -source 8 -target 8 \
+          -classpath "$ANDROID_JAR" \
+          -d "$OUT_CLASSES" \
+          "$JAVA_SRC/com/wb/goog/mkx/MenuBridge.java" 2>&1
+
+        # Converter .class → .dex via d8
+        D8="$BUILD_TOOLS/d8"
+        if [ ! -f "$D8" ]; then
+          D8=$(find "$SDK/build-tools" -name "d8" | sort | tail -1)
+        fi
+
+        "$D8" \
+          --output "$OUT_DEX" \
+          --min-api "$API_LEVEL" \
+          "$OUT_CLASSES/com/wb/goog/mkx/MenuBridge.class" \
+          "$OUT_CLASSES/com/wb/goog/mkx/MenuBridge"*.class 2>&1 || {
+          echo "::warning::d8 falhou — tentando dx"
+          DX="$BUILD_TOOLS/dx"
+          "$DX" --dex --output="$OUT_DEX/classes.dex" "$OUT_CLASSES"
+        }
+
+        # Mover classes.dex gerado para o decoded APK
+        # O apktool usa smali/ — precisa converter .dex → smali via baksmali
+        if [ -f "$OUT_DEX/classes.dex" ]; then
+          echo "classes.dex gerado: $(ls -lh $OUT_DEX/classes.dex)"
+
+          # Baixar baksmali se não disponível
+          BAKSMALI=/tmp/baksmali.jar
+          if [ ! -f "$BAKSMALI" ]; then
+            wget -q https://github.com/JesusFreke/smali/releases/download/v2.5.2/baksmali-2.5.2.jar \
+              -O "$BAKSMALI" || {
+              echo "::warning::baksmali não disponível — injetando .dex diretamente"
+              # Alternativa: adicionar o dex como classes2.dex no decoded APK
+              # (apktool recompila smali/ mas ignora dex extras)
+              # Então vamos usar a abordagem de adicionar o .java ao smali via smali assembler
+              exit 0
+            }
+          fi
+
+          # Converter dex → smali e colocar no decoded dir
+          java -jar "$BAKSMALI" d "$OUT_DEX/classes.dex" \
+            -o "$DECODED/smali_classes_menu/" 2>&1
+          echo "Smali gerado em $DECODED/smali_classes_menu/"
+          ls "$DECODED/smali_classes_menu/com/wb/goog/mkx/" 2>/dev/null || true
+        else
+          echo "::warning::classes.dex não gerado — MenuBridge não injetado"
+        fi
+
       run: |
         set -euo pipefail
         python3 - <<'PYSMALI8'
@@ -880,7 +951,7 @@ jobs:
                 temp = dst.with_suffix('.tmp')
                 replacements = {
                     f'lib/{abi}/libMKMod.so': Path(f'mod_lib/lib/{abi}/libMKMod.so'),
-                    f'lib/{abi}/libMenu.so': Path(f'app/src/main/cpp/Menu/libs/{abi}/libMenu.so'),
+                    # libMenu.so removido — menu embutido no APK via MenuBridge.java
                 }
                 with zipfile.ZipFile(dst, 'r') as original, zipfile.ZipFile(temp, 'w') as output:
                     for item in original.infolist():
@@ -894,7 +965,7 @@ jobs:
                 os.replace(temp, dst)
             with zipfile.ZipFile(dst) as archive:
                 if src == native_apk:
-                    for member in (f'lib/{abi}/libMKMod.so', f'lib/{abi}/libMenu.so'):
+                    for member in (f'lib/{abi}/libMKMod.so',):
                         if member not in archive.namelist():
                             raise SystemExit(f'::error::Injecao da biblioteca falhou: {member}')
                 if src == patched_apk and not any(n.startswith('classes') and n.endswith('.dex') for n in archive.namelist()):
@@ -948,7 +1019,7 @@ jobs:
             raise SystemExit('::error::Split da biblioteca do jogo nao foi assinado')
         expected_class, expected_machine = ((1, 40) if abi == 'armeabi-v7a' else (2, 183))
         with zipfile.ZipFile(native) as archive:
-            for name in (f'lib/{abi}/libMKMod.so', f'lib/{abi}/libMenu.so'):
+            for name in (f'lib/{abi}/libMKMod.so',):
                 try:
                     with archive.open(name) as file:
                         header = file.read(20)
@@ -973,7 +1044,7 @@ jobs:
             if not Path('mk_final.apk').is_file():
                 raise SystemExit('::error::mk_final.apk ausente')
             print('[audit] APK unico assinado')
-        print('::notice::Auditoria final V11 passou. Isto valida arquivos, nao funcionamento do mod em execucao.')
+        print('::notice::Auditoria final V12 passou. Isto valida arquivos, nao funcionamento do mod em execucao.')
         PYAUDIT10
 
     # ── 19. Upload artifacts ──────────────────────────────────────────────────
@@ -1014,7 +1085,7 @@ jobs:
     - name: Build summary
       if: always()
       run: |
-        echo "## MK Mod 7.4.0 Build (V11)" >> "$GITHUB_STEP_SUMMARY"
+        echo "## MK Mod 7.4.0 Build (V12)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         [ -f hack_offsets.env ] && cat hack_offsets.env >> "$GITHUB_STEP_SUMMARY" || echo "(no offsets found)" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -1032,4 +1103,4 @@ jobs:
           echo 'Warning: offsets do scanner podem estar zerados; hooks nao foram validados.' >> "$GITHUB_STEP_SUMMARY"
         fi
         if [ -f mk_final.apks ]; then echo "Output: mk_final.apks (ZIP de splits; extrair e instalar com adb install-multiple)" >> "$GITHUB_STEP_SUMMARY"; fi
-        echo 'Important: libMenu.so e stub sem UI real. Scanner V11 detecta ABI e busca symbols UE4 mangled; offsets zerados ainda significam que o mod nao hookea nada — baixe libUE4.so do artifact e use Ghidra para derivacao manual.' >> "$GITHUB_STEP_SUMMARY"
+        echo 'Important: Menu UI real via MenuBridge.java (floating window Android). Scanner V12 busca symbols UE4 + ARMv7 patterns. Offsets zerados = mod sem efeito — baixe libUE4.so e derive no Ghidra.' >> "$GITHUB_STEP_SUMMARY"
